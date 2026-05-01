@@ -593,13 +593,13 @@ input,select,textarea{font-family:inherit;color:inherit}
 <div id="licenseScreen" class="screen-overlay hidden">
   <div class="license-container">
     <div class="license-icon"><i class="ri-key-2-line"></i></div>
-    <h1 class="font-display">Company ID</h1>
-    <p>Enter your Company ID to activate NeXus HRMS.</p>
+    <h1 class="font-display">License Activation</h1>
+    <p>Enter your license key to activate NeXus HRMS.</p>
     <input type="text" id="licenseKeyInput" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" autocomplete="off">
     <div id="licenseMsg" class="license-msg"></div>
     <div class="license-actions">
       <button class="btn btn-primary" id="validateBtn" onclick="validateLicense()"><i class="ri-shield-check-line"></i> Validate</button>
-      <button class="btn btn-ghost" onclick="showRequestModal()"><i class="ri-question-line"></i> I don't have a Company ID</button>
+      <button class="btn btn-ghost" onclick="showRequestModal()"><i class="ri-question-line"></i> I don't have a license key</button>
     </div>
   </div>
 </div>
@@ -608,7 +608,7 @@ input,select,textarea{font-family:inherit;color:inherit}
 <div id="requestModal" class="modal-backdrop">
   <div class="modal-content">
     <button class="modal-close-btn" onclick="closeRequestModal()"><i class="ri-close-line"></i></button>
-    <h2 class="font-display">Request a Company ID</h2>
+    <h2 class="font-display">Request a License</h2>
     <p>Fill in your details and our team will get back to you.</p>
     <label>Company Name</label>
     <input type="text" id="reqCompany" class="input-field" placeholder="Your company name">
@@ -753,8 +753,8 @@ input,select,textarea{font-family:inherit;color:inherit}
       <button class="btn btn-secondary" onclick="closeForgotOverlay()">Cancel</button>
     </div>
     <div id="forgotStep2" style="display:none">
-      <h2>Verify Your Company ID</h2>
-      <p style="color:rgb(var(--text-secondary));margin-bottom:16px">Enter your Company ID to reset your <span id="forgotFieldLabel">username</span>.</p>
+      <h2>Verify Your License</h2>
+      <p style="color:rgb(var(--text-secondary));margin-bottom:16px">Enter your license key to reset your <span id="forgotFieldLabel">username</span>.</p>
       <input type="text" id="forgotLicenseKey" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" style="margin-bottom:12px">
       <div id="forgotMsg" class="license-msg"></div>
       <div class="modal-actions" style="margin-top:16px">
@@ -905,7 +905,7 @@ function formatDate(d){if(!d)return'';try{const dt=new Date(d);return dt.toLocal
 function formatDateTime(d){if(!d)return'';try{const dt=new Date(d);return dt.toLocaleDateString('en-PK',{day:'numeric',month:'short',year:'numeric'})+' '+dt.toLocaleTimeString('en-PK',{hour:'2-digit',minute:'2-digit',hour12:true})}catch(e){return d}}
 
 /* ═══════════════════════════════════════════
-   SESSION MANAGEMENT (persistent — until Clear Session)
+   SESSION MANAGEMENT (12-hour localStorage)
    ═══════════════════════════════════════════ */
 function saveSession(data){
   data.sessionStart = new Date().toISOString();
@@ -915,7 +915,12 @@ function getSession(){
   try{
     const raw = localStorage.getItem(SESSION_KEY);
     if(!raw) return null;
-    return JSON.parse(raw);
+    const s = JSON.parse(raw);
+    const start = new Date(s.sessionStart);
+    const now = new Date();
+    const hours = (now - start) / (1000*60*60);
+    if(hours >= SESSION_HOURS){localStorage.removeItem(SESSION_KEY);return null;}
+    return s;
   }catch(e){return null;}
 }
 function clearSession(){localStorage.removeItem(SESSION_KEY);localStorage.removeItem(STORAGE_KEY);}
@@ -1286,7 +1291,7 @@ function initDashboard(){
   nexus$('userRoleSidebar').textContent = DASH.role === 'employee' ? 'Employee' : 'Administrator';
 
   buildDashboardPages();
-  switchTab(DASH.role === 'employee' ? 'attendance' : 'dashboard');
+  switchTab('dashboard');
   loadDashboardData();
   updateSetupProgress();
 
@@ -1304,11 +1309,13 @@ function getNavItems(){
   const hasEmployeePortal = STATE.portalType === 'admin_employee';
 
   if(DASH.role === 'employee'){
-    // Employee: Attendance + Requests only (Dashboard & Messages removed)
+    // (p) Employee: only performance overview, attendance, messages, requests
     const items = [
+      {id:'dashboard',label:'Dashboard',icon:'ri-dashboard-line'},
       {id:'attendance',label:'Attendance',icon:'ri-calendar-check-line'},
       {id:'requests',label:'Requests',icon:'ri-file-list-3-line'}
     ];
+    if(hasEmployeePortal) items.splice(2,0,{id:'messages',label:'Messages',icon:'ri-message-3-line'});
     return items;
   }
 
@@ -1330,10 +1337,9 @@ function getNavItems(){
 }
 
 function buildNav(items){
-  const activeId = DASH.role === 'employee' ? 'attendance' : 'dashboard';
-  const sidebarHtml = items.map(i=>`<div class="dash-nav-item${i.id===activeId?' active':''}" data-tab="${i.id}" onclick="switchTab('${i.id}')"><i class="${i.icon}"></i><span>${i.label}</span>${i.id==='requests'?'<span class="dash-nav-badge" id="navBadgeRequests" style="display:none">0</span>':''}</div>`).join('');
+  const sidebarHtml = items.map(i=>`<div class="dash-nav-item${i.id==='dashboard'?' active':''}" data-tab="${i.id}" onclick="switchTab('${i.id}')"><i class="${i.icon}"></i><span>${i.label}</span>${i.id==='requests'?'<span class="dash-nav-badge" id="navBadgeRequests" style="display:none">0</span>':''}</div>`).join('');
   nexus$('sidebarNav').innerHTML = sidebarHtml;
-  nexus$('topbarNav').innerHTML = items.map(i=>`<div class="dash-nav-item${i.id===activeId?' active':''}" data-tab="${i.id}" onclick="switchTab('${i.id}')"><i class="${i.icon}"></i><span>${i.label}</span></div>`).join('');
+  nexus$('topbarNav').innerHTML = items.map(i=>`<div class="dash-nav-item${i.id==='dashboard'?' active':''}" data-tab="${i.id}" onclick="switchTab('${i.id}')"><i class="${i.icon}"></i><span>${i.label}</span></div>`).join('');
 }
 
 function switchTab(tabId){
@@ -1355,7 +1361,7 @@ function buildDashboardPages(){
 
   content.innerHTML = `
     <!-- DASHBOARD -->
-    <div class="dash-page${isAdmin?' active':''}" id="page-dashboard">    
+    <div class="dash-page active" id="page-dashboard">
       <div class="page-header">
         <h1 class="page-title">Dashboard</h1>
         <div class="page-actions">
@@ -1448,21 +1454,46 @@ function buildDashboardPages(){
         <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Employee</th><th>Status</th><th>Check In</th><th>Check Out</th><th>Hours</th><th>Deduction</th><th>Daily Wage</th><th>Actions</th></tr></thead><tbody id="attTableBody"></tbody></table></div>
       </div>
       `:`
-      <!-- EMPLOYEE CLOCK VIEW (Clock In/Out only) -->
+      <!-- EMPLOYEE CLOCK VIEW -->
       <div class="emp-clock-view">
         <div class="clock-display" id="empClockDisplay">00:00:00</div>
         <div class="clock-date" id="empClockDate"></div>
-        <div class="clock-status" id="empClockStatus" style="margin:8px 0 20px;font-size:.85rem;color:rgb(var(--text-muted))"></div>
 
         <div class="clock-btn-group">
           <button class="clock-btn clock-btn-in" id="empClockInBtn" onclick="empBioClock('in')">
-            <i class="ri-login-circle-line"></i>
+            <i class="ri-fingerprint-line"></i>
             Clock In
+            <span class="bio-label">Biometric Verify</span>
           </button>
           <button class="clock-btn clock-btn-out" id="empClockOutBtn" onclick="empBioClock('out')" disabled>
-            <i class="ri-logout-circle-line"></i>
+            <i class="ri-fingerprint-line"></i>
             Clock Out
+            <span class="bio-label">Biometric Verify</span>
           </button>
+        </div>
+
+        <div class="emp-stats">
+          <div class="emp-stat-card">
+            <div class="emp-stat-value" id="empStatHours">0h 0m</div>
+            <div class="emp-stat-label">Today's Hours</div>
+            <div class="emp-stat-sub" id="empStatShift">—</div>
+          </div>
+          <div class="emp-stat-card">
+            <div class="emp-stat-value" id="empStatWage" style="color:rgb(var(--accent3))">PKR 0</div>
+            <div class="emp-stat-label">Earned Today</div>
+            <div class="emp-stat-sub" id="empStatWageBase">of PKR 0/day</div>
+          </div>
+          <div class="emp-stat-card">
+            <div class="emp-stat-value" id="empStatDeduction" style="color:rgb(var(--danger))">PKR 0</div>
+            <div class="emp-stat-label">Late Deduction</div>
+            <div class="emp-stat-sub" id="empStatLateMin">On time</div>
+          </div>
+        </div>
+
+        <!-- Today's log -->
+        <div class="data-table-wrapper" style="text-align:left">
+          <div class="data-table-header"><div class="data-table-title">My Attendance Log</div></div>
+          <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Date</th><th>Check In</th><th>Check Out</th><th>Hours</th><th>Status</th></tr></thead><tbody id="empAttTableBody"></tbody></table></div>
         </div>
       </div>
       `}
@@ -1595,6 +1626,7 @@ function buildDashboardPages(){
         <div class="file-card" onclick="showCompanyInfoModal()"><i class="ri-building-line"></i><div class="file-card-title">Company Information</div><div class="file-card-desc">Name, address, phone, email</div></div>
         <div class="file-card" onclick="showWorkingHoursModal()"><i class="ri-time-line"></i><div class="file-card-title">Working Hours</div><div class="file-card-desc">Define official hours</div></div>
         <div class="file-card" onclick="showDeductionModal()"><i class="ri-percent-line"></i><div class="file-card-title">Deduction Criteria</div><div class="file-card-desc">Late deduction rules</div></div>
+        <div class="file-card" onclick="showScoreSettingsModal()"><i class="ri-bar-chart-line"></i><div class="file-card-title">Employee Score</div><div class="file-card-desc">Score calculation weights</div></div>
         <div class="file-card" onclick="showThemeSettingsModal()"><i class="ri-palette-line"></i><div class="file-card-title">Theme & Layout</div><div class="file-card-desc">Change appearance</div></div>
         <div class="file-card" onclick="showPoliciesModal()"><i class="ri-book-line"></i><div class="file-card-title">Policies & Rules</div><div class="file-card-desc">Company policies</div></div>
       </div>
@@ -3296,371 +3328,6 @@ document.addEventListener('DOMContentLoaded',()=>{
       createScrollPicker(input);
     }
   });
-})();
-
-/* ═══════════════════════════════════════════════════════════════════════
-   ▼▼▼ NEXUS v1.05 OVERRIDES — Amendments layer
-   PKT clock window · Loading states · Score removal · Preload · Mobile
-   ═══════════════════════════════════════════════════════════════════════ */
-(function(){
-  'use strict';
-
-  /* ── Default settings: Pakistan timezone ── */
-  const PKT_TZ = 'Asia/Karachi';
-  const SHIFT_START_HOUR = 17; // 5pm PKT — Clock In opens
-  const SHIFT_END_HOUR   = 6;  // 6am PKT — Clock Out closes
-
-  /* Get current Pakistan time as {h,m,s,minutes} regardless of device TZ */
-  function nowPKT(){
-    const parts = new Intl.DateTimeFormat('en-GB',{
-      timeZone:PKT_TZ,hour12:false,
-      hour:'2-digit',minute:'2-digit',second:'2-digit'
-    }).formatToParts(new Date());
-    const get = t => Number(parts.find(p=>p.type===t).value);
-    const h = get('hour') % 24, m = get('minute'), s = get('second');
-    return {h,m,s,minutes:h*60+m};
-  }
-  function fmtPKT(){
-    return new Intl.DateTimeFormat('en-GB',{
-      timeZone:PKT_TZ,hour12:false,
-      hour:'2-digit',minute:'2-digit',second:'2-digit'
-    }).format(new Date());
-  }
-  function fmtPKTDate(){
-    return new Intl.DateTimeFormat('en-PK',{
-      timeZone:PKT_TZ,weekday:'long',year:'numeric',month:'long',day:'numeric'
-    }).format(new Date());
-  }
-
-  /* Clock-in window state:
-     - clockIn  available 17:00–23:59 AND 00:00–05:59 (overnight shift)
-     - clockOut available only when there's an open loop AND time < 06:00
-       (between 06:00 and 17:00, clockOut is locked) */
-  function clockWindow(){
-    const {h} = nowPKT();
-    const inWindow = (h >= SHIFT_START_HOUR) || (h < SHIFT_END_HOUR);
-    const outAllowed = (h < SHIFT_END_HOUR) || (h >= SHIFT_START_HOUR);
-    return {
-      canClockIn:  inWindow,
-      canClockOut: outAllowed,
-      beforeShift: h >= SHIFT_END_HOUR && h < SHIFT_START_HOUR
-    };
-  }
-
-  /* Local loop tracking for double-punch prevention */
-  const LOOP_KEY = 'nexus_clock_loops_v1';
-  function loadLoops(){
-    try{const r=localStorage.getItem(LOOP_KEY);return r?JSON.parse(r):{}}catch(e){return {}}
-  }
-  function saveLoops(l){localStorage.setItem(LOOP_KEY,JSON.stringify(l))}
-  function todayKey(){
-    // shift "day" = the date the shift started (5pm). Subtract 6h so 00:00–05:59 maps to previous date.
-    const d = new Date(Date.now() - 6*3600*1000);
-    return new Intl.DateTimeFormat('en-CA',{timeZone:PKT_TZ}).format(d); // YYYY-MM-DD
-  }
-  function getEmpId(){const s=getSession();return s && s.employeeId ? s.employeeId : (s ? s.username : 'guest')}
-  function getMyLoops(){
-    const all = loadLoops();
-    const k = getEmpId()+'|'+todayKey();
-    return all[k] || [];
-  }
-  function setMyLoops(loops){
-    const all = loadLoops();
-    all[getEmpId()+'|'+todayKey()] = loops;
-    saveLoops(all);
-  }
-  function hasOpenLoop(){
-    const loops = getMyLoops();
-    return loops.length>0 && !loops[loops.length-1].out;
-  }
-
-  /* Update clock + buttons every second */
-  function refreshClockUI(){
-    const dispEl  = document.getElementById('empClockDisplay');
-    const dateEl  = document.getElementById('empClockDate');
-    const statusEl= document.getElementById('empClockStatus');
-    const inBtn   = document.getElementById('empClockInBtn');
-    const outBtn  = document.getElementById('empClockOutBtn');
-    if(!dispEl) return; // not on attendance tab
-
-    dispEl.textContent = fmtPKT() + ' PKT';
-    if(dateEl) dateEl.textContent = fmtPKTDate();
-
-    const w = clockWindow();
-    const open = hasOpenLoop();
-    let statusText = '', inDisabled = false, outDisabled = false, inReason='', outReason='';
-
-    if(!w.canClockIn){
-      inDisabled = true; inReason = 'Available at 5:00 PM PKT';
-    } else if(open){
-      inDisabled = true; inReason = 'Clock out first';
-    }
-    if(!open){
-      outDisabled = true; outReason = 'Clock in first';
-    } else if(!w.canClockOut){
-      outDisabled = true; outReason = 'Window closed at 6:00 AM PKT';
-    }
-
-    if(w.beforeShift){
-      statusText = 'Shift window opens at 5:00 PM PKT';
-    } else if(open){
-      statusText = 'Currently clocked in — remember to clock out before 6:00 AM PKT';
-    } else {
-      const loops = getMyLoops();
-      statusText = loops.length
-        ? 'Loop '+loops.length+' completed. You can clock in again until 6:00 AM PKT.'
-        : 'Working window 5:00 PM – 6:00 AM PKT';
-    }
-    if(statusEl) statusEl.textContent = statusText;
-
-    [[inBtn,inDisabled,inReason],[outBtn,outDisabled,outReason]].forEach(([b,dis,r])=>{
-      if(!b || b.dataset.busy==='1') return;
-      b.disabled = dis;
-      b.title = dis ? r : '';
-      b.style.opacity = dis ? '.45' : '';
-      b.style.cursor  = dis ? 'not-allowed' : '';
-    });
-  }
-  setInterval(refreshClockUI, 1000);
-  // Also refresh on tab switch
-  const _origSwitchTab = window.switchTab;
-  window.switchTab = function(id){
-    _origSwitchTab(id);
-    if(id==='attendance') setTimeout(refreshClockUI,50);
-  };
-
-  /* ── Override clock handler with PKT rules + loop tracking ── */
-  window.empBioClock = async function(type){
-    const inBtn  = document.getElementById('empClockInBtn');
-    const outBtn = document.getElementById('empClockOutBtn');
-    const btn = type==='in' ? inBtn : outBtn;
-    const w = clockWindow();
-    const open = hasOpenLoop();
-
-    if(type==='in'){
-      if(!w.canClockIn){ alert('Clock In is only available between 5:00 PM and 6:00 AM PKT.'); return; }
-      if(open){ alert('You already have an open loop. Please clock out first.'); return; }
-    } else {
-      if(!open){ alert('No active clock-in to close.'); return; }
-      if(!w.canClockOut){ alert('Clock Out window closed at 6:00 AM PKT.'); return; }
-    }
-
-    const origHTML = btn ? btn.innerHTML : '';
-    if(btn){
-      btn.dataset.busy='1'; btn.disabled=true;
-      btn.innerHTML = '<i class="ri-loader-4-line" style="animation:clockSpin 1s linear infinite;font-size:28px"></i> '+(type==='in'?'Clocking In…':'Clocking Out…');
-    }
-
-    // Simulate small network delay so the loading state is visible (min 350ms)
-    const stamp = fmtPKT();
-    await new Promise(r=>setTimeout(r,400));
-
-    const loops = getMyLoops();
-    if(type==='in'){
-      loops.push({in:stamp, out:null});
-    } else {
-      loops[loops.length-1].out = stamp;
-    }
-    setMyLoops(loops);
-
-    // Best-effort backend sync (non-blocking; ignored on failure)
-    try{
-      const session = getSession();
-      if(session && typeof apiPost === 'function' && type==='in'){
-        apiPost({action:'markAttendanceBiometric',type:'clockIn',
-          licenseKey:STATE.licenseKey,employeeId:session.employeeId,
-          employeeName:session.username,date:todayKey(),checkIn:stamp,
-          status:'Present',authMethod:'PKT-Window'}).catch(()=>{});
-      } else if(session && typeof apiPost === 'function'){
-        apiPost({action:'markAttendanceBiometric',type:'clockOut',
-          licenseKey:STATE.licenseKey,employeeId:session.employeeId,
-          date:todayKey(),checkOut:stamp,authMethod:'PKT-Window'}).catch(()=>{});
-      }
-    }catch(e){}
-
-    if(btn){
-      btn.innerHTML = '<i class="ri-check-line" style="font-size:28px"></i> '+(type==='in'?'Clocked In':'Clocked Out');
-      setTimeout(()=>{
-        if(btn){ btn.innerHTML = origHTML; btn.dataset.busy='0'; }
-        refreshClockUI();
-      }, 1000);
-    }
-  };
-
-  /* Auto-close any open loop at 06:00 PKT (auto_closed flag) */
-  setInterval(()=>{
-    const {h,m} = nowPKT();
-    if(h===SHIFT_END_HOUR && m===0 && hasOpenLoop()){
-      const loops = getMyLoops();
-      loops[loops.length-1].out = fmtPKT();
-      loops[loops.length-1].auto_closed = true;
-      setMyLoops(loops);
-      refreshClockUI();
-    }
-  }, 30000);
-
-  /* ── Generic loading-state helper for any [data-loading] button ── */
-  function withLoading(btn, label){
-    if(!btn || btn.dataset.busy==='1') return ()=>{};
-    const orig = btn.innerHTML;
-    btn.dataset.busy='1'; btn.disabled=true;
-    btn.innerHTML = '<i class="ri-loader-4-line" style="animation:clockSpin 1s linear infinite"></i> '+(label||'Loading…');
-    const start = Date.now();
-    return ()=>{
-      const wait = Math.max(0, 250 - (Date.now()-start));
-      setTimeout(()=>{ btn.innerHTML = orig; btn.dataset.busy='0'; btn.disabled=false; }, wait);
-    };
-  }
-  window.withLoading = withLoading;
-
-  /* Auto-wrap common action buttons with a brief loading flash on click */
-  document.addEventListener('click', function(e){
-    const btn = e.target.closest('button.btn-primary, button.btn-success, button.btn-danger');
-    if(!btn) return;
-    if(btn.dataset.busy==='1') return;
-    if(btn.id==='empClockInBtn' || btn.id==='empClockOutBtn') return; // handled above
-    if(!btn.getAttribute('onclick')) return;
-    // Quick visual feedback (300ms)
-    const orig = btn.innerHTML;
-    btn.dataset.busy='1';
-    btn.innerHTML = '<i class="ri-loader-4-line" style="animation:clockSpin 1s linear infinite"></i> Working…';
-    setTimeout(()=>{ btn.innerHTML = orig; btn.dataset.busy='0'; }, 350);
-  }, true);
-
-  /* ── Hide remaining Score UI (defensive — in case any path renders it) ── */
-  const styleEl = document.createElement('style');
-  styleEl.textContent = `
-    /* Score system removed */
-    [onclick*="showScoreSettingsModal"], #scoreSettingsModal { display: none !important; }
-    .emp-detail-tag:has-text("Score"){ display:none; } /* fallback */
-
-    /* Mobile improvements */
-    @media (max-width: 768px){
-      .dash-sidebar{ width: min(280px, 84vw); box-shadow: 0 0 0 9999px rgba(0,0,0,0); transition: transform .3s, box-shadow .3s; }
-      .dash-sidebar.open{ box-shadow: 0 0 0 9999px rgba(0,0,0,.5); }
-      .dash-topbar, .dash-header{ padding-left: 12px !important; padding-right: 12px !important; }
-      .page-header{ flex-direction: column; align-items: flex-start; gap: 12px; }
-      .page-actions{ width: 100%; flex-wrap: wrap; }
-      .page-actions .btn, .page-actions .filter-select, .page-actions .search-input{ flex: 1 1 140px; min-width: 0; }
-      .clock-btn-group{ flex-direction: column; gap: 14px; }
-      .clock-btn{ width: 100%; min-height: 96px; font-size: 1.05rem; }
-      .modal-content{ padding: 20px 16px; }
-      .modal-actions{ flex-direction: column; }
-      .modal-actions .btn{ width: 100%; }
-      .data-table-wrapper{ font-size: .82rem; }
-      .att-metric-card{ padding: 14px; }
-      #clearSessionBtn{ bottom: 12px; right: 12px; padding: 6px 12px; font-size: 11px; }
-    }
-    @media (max-width: 480px){
-      .clock-display{ font-size: 2.2rem !important; }
-      .clock-date{ font-size: .85rem; }
-      .stat-grid{ grid-template-columns: 1fr !important; }
-      .file-grid{ grid-template-columns: 1fr 1fr !important; }
-      .theme-card{ width: 46% !important; }
-    }
-
-    /* Body scroll-lock when sidebar drawer open */
-    body.sidebar-open{ overflow: hidden; }
-  `;
-  document.head.appendChild(styleEl);
-
-  /* Body scroll-lock when sidebar drawer is open (mobile) */
-  const _toggleSidebar = window.toggleSidebar;
-  window.toggleSidebar = function(){
-    _toggleSidebar();
-    const sb = document.getElementById('dashSidebar');
-    document.body.classList.toggle('sidebar-open', sb && sb.classList.contains('open'));
-  };
-  // Close drawer when clicking outside
-  document.addEventListener('click', function(e){
-    const sb = document.getElementById('dashSidebar');
-    if(!sb || !sb.classList.contains('open')) return;
-    if(sb.contains(e.target)) return;
-    if(e.target.closest('#sidebarToggle')) return;
-    sb.classList.remove('open');
-    document.body.classList.remove('sidebar-open');
-  });
-
-  /* DOM cleanup pass — strip Score columns/widgets that slip through */
-  function purgeScore(){
-    document.querySelectorAll('.emp-detail-tag').forEach(el=>{
-      if(/score/i.test(el.textContent)) el.remove();
-    });
-    document.querySelectorAll('.stat-card-label').forEach(el=>{
-      if(/score/i.test(el.textContent)) el.closest('.stat-card')?.remove();
-    });
-    // Remove "Score" column header + cells from any table
-    document.querySelectorAll('table.data-table').forEach(tbl=>{
-      const ths = [...tbl.querySelectorAll('thead th')];
-      const idx = ths.findIndex(th=>/^score/i.test(th.textContent.trim()));
-      if(idx>-1){
-        ths[idx].remove();
-        tbl.querySelectorAll('tbody tr').forEach(tr=>{
-          const tds = tr.querySelectorAll('td');
-          if(tds[idx]) tds[idx].remove();
-        });
-      }
-    });
-  }
-  // Run after each tab switch / data load
-  const _origBuildPages = window.buildDashboardPages;
-  if(typeof _origBuildPages === 'function'){
-    window.buildDashboardPages = function(){ _origBuildPages.apply(this,arguments); setTimeout(purgeScore,50); };
-  }
-  setInterval(purgeScore, 1500);
-
-  /* Stub the score-settings modal so any leftover invocation no-ops cleanly */
-  window.showScoreSettingsModal = function(){ /* removed in v1.05 */ };
-
-  /* ── Preload everything after login (before reveal) ── */
-  const _origShowLoading = window.showLoadingThenDashboard;
-  window.showLoadingThenDashboard = function(){
-    showScreen('loadingScreen');
-    const bar = document.getElementById('loadingBar');
-    const subEl = document.querySelector('#loadingScreen .loading-sub') || (function(){
-      const el = document.createElement('div');
-      el.className='loading-sub';
-      el.style.cssText='margin-top:14px;color:rgb(var(--text-secondary));font-size:.85rem;letter-spacing:1px';
-      el.textContent='Preparing your workspace…';
-      const ls = document.getElementById('loadingScreen');
-      if(ls) ls.appendChild(el);
-      return el;
-    })();
-    if(subEl) subEl.textContent = 'Preparing your workspace…';
-
-    let pct = 0;
-    const tick = setInterval(()=>{ pct = Math.min(pct+3, 92); if(bar) bar.style.width = pct+'%'; }, 80);
-
-    const tasks = [];
-    if(typeof apiGet === 'function' && STATE.licenseKey){
-      tasks.push(apiGet({action:'getDashboardData',key:STATE.licenseKey}).catch(()=>null));
-      tasks.push(apiGet({action:'getAttendance',key:STATE.licenseKey}).catch(()=>null));
-      tasks.push(apiGet({action:'getRequests',key:STATE.licenseKey}).catch(()=>null));
-      tasks.push(apiGet({action:'getSettings',key:STATE.licenseKey}).catch(()=>null));
-    }
-    // Min visible time so it doesn't flash
-    tasks.push(new Promise(r=>setTimeout(r,900)));
-
-    Promise.all(tasks).finally(()=>{
-      clearInterval(tick);
-      if(bar) bar.style.width = '100%';
-      setTimeout(()=>{
-        const ls = document.getElementById('loadingScreen');
-        if(ls) ls.classList.add('hidden');
-        initDashboard();
-      }, 250);
-    });
-  };
-
-  /* Confirm Clear Session click + show loading */
-  const csb = document.getElementById('clearSessionBtn');
-  if(csb){
-    csb.onclick = function(){
-      if(!confirm('Clear your session and return to login?')) return;
-      csb.innerHTML = '<i class="ri-loader-4-line" style="animation:clockSpin 1s linear infinite"></i> Clearing…';
-      setTimeout(()=>{ localStorage.clear(); location.reload(); }, 300);
-    };
-  }
 })();
 
 </script>
