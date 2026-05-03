@@ -877,7 +877,7 @@ if(typeof jQuery !== "undefined") { jQuery.noConflict(); }
 /* ═══════════════════════════════════════════
    CONFIG & STATE
    ═══════════════════════════════════════════ */
-const API_URL = 'https://script.google.com/macros/s/AKfycbzA9Nfb7XwtQggJWkrWuIu_XpvYdBEqFIHqI0eGReUfwU51w9bE5-bC6dzN6fUhT8Cv/exec';
+const API_URL = 'https://script.google.com/macros/s/AKfycbytDm4NoitEXP1zTr-5OSKKPVZ_qZ0DHNxaGCLNssbiLWTk4a4rpT0wIH0tg9rqMzJN/exec';
 const SESSION_KEY = 'nexus_session';
 const STORAGE_KEY = 'nexus_hrms_state';
 const SESSION_HOURS = 12;
@@ -2275,7 +2275,7 @@ function closeBioRegOverlay(){
   try{ pendingClockType = null; }catch(e){}
 }
 
-
+async function startBiometricRegistration() {
   const btn = nexus$('bioRegBtn');
   btn.disabled = true;
   btn.innerHTML = dots();
