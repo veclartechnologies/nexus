@@ -876,7 +876,7 @@ if(typeof jQuery !== "undefined") { jQuery.noConflict(); }
 /* ═══════════════════════════════════════════
    CONFIG & STATE
    ═══════════════════════════════════════════ */
-const API_URL = 'https://script.google.com/macros/s/AKfycbzA9Nfb7XwtQggJWkrWuIu_XpvYdBEqFIHqI0eGReUfwU51w9bE5-bC6dzN6fUhT8Cv/exec';
+const API_URL = 'https://script.google.com/macros/s/AKfycbw1-Xk2IwoQlERvfF3xXzZqT9MtNasj-N2bznvMn7OlyQ6e9r2e5QAHraHRhG7SGjkq/exec';
 const SESSION_KEY = 'nexus_session';
 const STORAGE_KEY = 'nexus_hrms_state';
 const SESSION_HOURS = 12;
@@ -2159,7 +2159,7 @@ async function empBioClock(type) {
 /* ── BIOMETRIC REGISTRATION (first time) ── */
 function showBiometricRegistration(pendingClockType) {
   nexus$('bioRegOverlay').classList.add('active');
-  nexus$('bioRegOverlay').dataset.pendingType = pendingClockType;
+  nexus$('bioRegOverlay').dataset.pendingType = (pendingClockType === 'in' || pendingClockType === 'out') ? pendingClockType : '';
   nexus$('bioRegMsg').className = 'license-msg';
   nexus$('bioRegBtn').disabled = false;
   nexus$('bioRegBtn').innerHTML = '<i class="ri-fingerprint-line"></i> Start Registration';
@@ -2226,11 +2226,11 @@ async function startBiometricRegistration() {
       setMsg('bioRegMsg', '<i class="ri-check-line"></i> Fingerprint registered successfully!', 'success');
       btn.innerHTML = '<i class="ri-check-line"></i> Registered!';
 
-      // Auto-close and proceed with clock
+      // Auto-close and proceed with clock (only if a real clock action is pending)
       const pendingType = nexus$('bioRegOverlay').dataset.pendingType;
       setTimeout(async () => {
         nexus$('bioRegOverlay').classList.remove('active');
-        if (pendingType) await verifyBiometric(pendingType);
+        if (pendingType === 'in' || pendingType === 'out') await verifyBiometric(pendingType);
       }, 1500);
     } else {
       throw new Error(d.error || 'Failed to save biometric');
@@ -3898,24 +3898,9 @@ document.addEventListener('DOMContentLoaded',()=>{
     const sp = document.getElementById('setupProgress');
     if(sp) sp.style.display = 'none';
 
-    // Floating hamburger — visible on mobile in BOTH layouts (sidebar layout
-    // hides .dash-topbar entirely so the original toggle is unreachable).
-    if(!document.getElementById('mobileMenuBtn')){
-      const hb = document.createElement('button');
-      hb.id = 'mobileMenuBtn';
-      hb.setAttribute('aria-label','Open menu');
-      hb.innerHTML = '<i class="ri-menu-line"></i>';
-      hb.onclick = function(ev){
-        ev.stopPropagation();
-        if (typeof window.toggleSidebar === 'function') {
-          window.toggleSidebar();
-        } else {
-          const sb = document.getElementById('dashSidebar');
-          if (sb) sb.classList.toggle('open');
-        }
-      };
-      document.body.appendChild(hb);
-    }
+    // Floating hamburger removed per request — only header sidebar-toggle remains.
+    const existingHb = document.getElementById('mobileMenuBtn');
+    if (existingHb) existingHb.remove();
 
     // Move Clear Session into sidebar footer; hide floating one
     const sidebarFooter = document.querySelector('.dash-sidebar-footer');
@@ -3948,18 +3933,9 @@ document.addEventListener('DOMContentLoaded',()=>{
 
   const mobStyle = document.createElement('style');
   mobStyle.textContent = `
-    #mobileMenuBtn{
-      display:none; position:fixed; top:14px; left:14px; z-index:9999;
-      width:44px; height:44px; border-radius:12px; border:none;
-      background:rgb(var(--bg-card)); color:rgb(var(--text-primary));
-      box-shadow:0 4px 14px rgba(0,0,0,.18); cursor:pointer;
-      font-size:22px; backdrop-filter:blur(10px);
-      align-items:center; justify-content:center;
-    }
+    #mobileMenuBtn{ display:none !important; }
     @media (max-width: 768px){
-      #mobileMenuBtn{ display:flex !important; }
       .dash-sidebar{ z-index:9998; }
-      .dash-content{ padding-top: 56px !important; }
     }
     #clearSessionBtn{ display:none !important; }
     #setupProgress{ display:none !important; }
@@ -4154,33 +4130,61 @@ document.addEventListener('DOMContentLoaded',()=>{
   setInterval(()=>{ if(navigator.onLine) flushQueue(); }, 30000);
   updateQueuePill();
 
-  /* Override the v1.05 processClockAction to be offline-aware + optimistic */
+  /* Override the v1.05 processClockAction to be offline-aware + optimistic.
+     (c) Only queue/Pending when actually offline. Online failures surface a real error. */
+  const LOOP_KEY_LS = 'nexus_clock_loops_v1';
+  function _loadLoopsLS(){ try{return JSON.parse(localStorage.getItem(LOOP_KEY_LS)||'{}')}catch(e){return {}} }
+  function _saveLoopsLS(v){ localStorage.setItem(LOOP_KEY_LS, JSON.stringify(v)); }
+  function _todayKey(){
+    const d = new Date(Date.now() - 6*3600*1000);
+    return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Karachi'}).format(d);
+  }
+  function _empLoopKey(empId){ return empId+'|'+_todayKey(); }
+  function _restoreClockBtn(which){
+    if(which==='in'){
+      const b = document.getElementById('empClockInBtn');
+      if(b) b.innerHTML = '<i class="ri-login-circle-line"></i> Clock In';
+    } else {
+      const b = document.getElementById('empClockOutBtn');
+      if(b) b.innerHTML = '<i class="ri-logout-circle-line"></i> Clock Out';
+    }
+  }
+
   const _v105ProcessClock = window.processClockAction;
   window.processClockAction = async function(type){
     const session = (typeof getSession==='function') ? getSession() : null;
     if(!session || !session.employeeId) return;
 
-    // Compute PKT time (HH:MM:SS) using same formatter as v1.05 layer
     const pktFmt = new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Karachi',hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date());
     const dateStr = new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Karachi'}).format(new Date());
     const emp = (window.DASH && DASH.employees) ? DASH.employees.find(e=>e.id===session.employeeId) || {} : {};
 
     // Optimistic UI immediately
+    const inBtn = document.getElementById('empClockInBtn');
+    const outBtn = document.getElementById('empClockOutBtn');
     if(type==='in'){
-      const btn = document.getElementById('empClockInBtn');
-      const outBtn = document.getElementById('empClockOutBtn');
       window.todayCheckins = window.todayCheckins || {};
       window.todayCheckins[session.employeeId] = { checkIn:pktFmt, checkOut:'', hours:0, status:'Present' };
-      if(btn){ btn.disabled=true; btn.innerHTML='<i class="ri-check-line" style="font-size:32px"></i><span>Clocked In</span>'; }
-      if(outBtn) outBtn.disabled=false;
+      if(inBtn){ inBtn.disabled=true; inBtn.innerHTML='<i class="ri-check-line" style="font-size:24px"></i> Clocked In'; }
+      if(outBtn){ outBtn.disabled=false; _restoreClockBtn('out'); }
+      // Persist open loop for refreshClockUI gating
+      const all=_loadLoopsLS(); const k=_empLoopKey(session.employeeId);
+      const loops=all[k]||[]; loops.push({in:pktFmt,out:null}); all[k]=loops; _saveLoopsLS(all);
     } else {
-      const btn = document.getElementById('empClockOutBtn');
-      const inBtn = document.getElementById('empClockInBtn');
       window.todayCheckins = window.todayCheckins || {};
       const ci = window.todayCheckins[session.employeeId] || {};
       ci.checkOut = pktFmt; window.todayCheckins[session.employeeId] = ci;
-      if(btn){ btn.disabled=true; btn.innerHTML='<i class="ri-check-line" style="font-size:32px"></i><span>Clocked Out</span>'; }
-      if(inBtn) inBtn.disabled=true;
+      if(outBtn){ outBtn.disabled=true; outBtn.innerHTML='<i class="ri-check-line" style="font-size:24px"></i> Clocked Out'; }
+      // Close loop locally
+      const all=_loadLoopsLS(); const k=_empLoopKey(session.employeeId);
+      const loops=all[k]||[];
+      if(loops.length && !loops[loops.length-1].out){ loops[loops.length-1].out=pktFmt; }
+      all[k]=loops; _saveLoopsLS(all);
+      // Re-enable Clock In for next loop after a brief delay
+      setTimeout(()=>{
+        if(inBtn){ inBtn.disabled=false; _restoreClockBtn('in'); }
+        if(outBtn){ _restoreClockBtn('out'); }
+      }, 1200);
     }
     if(typeof updateEmpStats==='function'){ try{updateEmpStats(session.employeeId)}catch(e){} }
 
@@ -4204,23 +4208,23 @@ document.addEventListener('DOMContentLoaded',()=>{
       checkOut:pktFmt, authMethod:'Fingerprint', geoLocation:geoStr, totalHours:'', timezone:'Asia/Karachi'
     };
 
+    // (c) Only enqueue when truly offline. Online failures show an error but don't go "Pending".
     if(!navigator.onLine){
       enqueue({ payload });
-      showToast((type==='in'?'Clock-in':'Clock-out')+' queued — will sync when online');
+      showToast((type==='in'?'Clock-in':'Clock-out')+' pending — will sync when online');
       return;
     }
     try{
       const d = await apiPost(payload);
       if(!d || !d.success){
-        // Network/API failed — queue for retry
-        enqueue({ payload });
-        showToast('Saved locally — will retry');
+        showToast((d && d.error) ? d.error : 'Action failed. Please try again.');
       } else {
         if(typeof loadAttendance==='function') try{loadAttendance()}catch(e){}
       }
     }catch(e){
+      // Network error mid-request — treat as offline and queue
       enqueue({ payload });
-      showToast('Saved locally — will retry');
+      showToast((type==='in'?'Clock-in':'Clock-out')+' pending — will sync when online');
     }
   };
 
