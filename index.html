@@ -601,7 +601,6 @@ input,select,textarea{font-family:inherit;color:inherit}
 <!-- ═══════ SPLASH ═══════ -->
 <div id="splashScreen" class="screen-overlay">
   <div class="splash-logo"><span class="ne">Ne</span><span class="x">X</span><span class="us">us</span></div>
-  <div class="splash-sub">Human Resource Management</div>
 </div>
 
 <!-- ═══════ LICENSE SCREEN ═══════ -->
@@ -609,8 +608,8 @@ input,select,textarea{font-family:inherit;color:inherit}
   <div class="license-container">
     <div class="license-icon"><i class="ri-key-2-line"></i></div>
     <h1 class="font-display">Company ID</h1>
-    <p>Enter your Company ID to activate NeXus HRMS.</p>
-    <input type="text" id="licenseKeyInput" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" autocomplete="off">
+    <p>Enter your Company ID to activate NeXus.</p>
+    <input type="text" id="licenseKeyInput" class="input-field" placeholder="XXXXXX" autocomplete="off">
     <div id="licenseMsg" class="license-msg"></div>
     <div class="license-actions">
       <button class="btn btn-primary" id="validateBtn" onclick="validateLicense()"><i class="ri-shield-check-line"></i> Validate</button>
@@ -641,9 +640,8 @@ input,select,textarea{font-family:inherit;color:inherit}
 
 <!-- ═══════ WELCOME ═══════ -->
 <div id="welcomeScreen" class="screen-overlay hidden">
-  <div class="welcome-badge">✦ Licensed</div>
-  <div class="welcome-title font-display">Welcome to <span class="welcome-company" id="welcomeCompanyName"></span></div>
-  <div class="welcome-sub">Let's set up your HRMS</div>
+  <div class="welcome-badge">✦</div>
+  <div class="welcome-title font-display">Welcome</span></div>
 </div>
 
 <!-- ═══════ SETUP: THEME ═══════ -->
@@ -770,7 +768,7 @@ input,select,textarea{font-family:inherit;color:inherit}
     <div id="forgotStep2" style="display:none">
       <h2>Verify Your Company ID</h2>
       <p style="color:rgb(var(--text-secondary));margin-bottom:16px">Enter your Company ID to reset your <span id="forgotFieldLabel">username</span>.</p>
-      <input type="text" id="forgotLicenseKey" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" style="margin-bottom:12px">
+      <input type="text" id="forgotLicenseKey" class="input-field" placeholder="XXXXXX" style="margin-bottom:12px">
       <div id="forgotMsg" class="license-msg"></div>
       <div class="modal-actions" style="margin-top:16px">
         <button class="btn btn-secondary" onclick="forgotGoBack()">Back</button>
@@ -2128,7 +2126,7 @@ function renderEmpAttCarousel(){
     let badgeHtml='', body='';
     if(weekend){
       badgeHtml='<span class="c3d-badge" style="background:rgba(99,102,241,.15);color:#a5b4fc">Weekend</span>';
-      body='<div class="c3d-desc" style="text-align:center;padding-top:14px">Enjoy your day off 🌴</div>';
+      body='<div class="c3d-desc" style="text-align:center;padding-top:14px">Enjoy your day off</div>';
     } else if(rec){
       const cls=rec.status==='Present'?'badge-active':rec.status==='Late'?'badge-pending':'badge-rejected';
       badgeHtml=`<span class="c3d-badge status-badge ${cls}">${rec.status||'—'}</span>`;
