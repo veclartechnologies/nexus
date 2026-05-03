@@ -601,6 +601,7 @@ input,select,textarea{font-family:inherit;color:inherit}
 <!-- ═══════ SPLASH ═══════ -->
 <div id="splashScreen" class="screen-overlay">
   <div class="splash-logo"><span class="ne">Ne</span><span class="x">X</span><span class="us">us</span></div>
+  <div class="splash-sub">Human Resource Management</div>
 </div>
 
 <!-- ═══════ LICENSE SCREEN ═══════ -->
@@ -608,8 +609,8 @@ input,select,textarea{font-family:inherit;color:inherit}
   <div class="license-container">
     <div class="license-icon"><i class="ri-key-2-line"></i></div>
     <h1 class="font-display">Company ID</h1>
-    <p>Enter your Company ID to activate NeXus.</p>
-    <input type="text" id="licenseKeyInput" class="input-field" placeholder="XXXXXX" autocomplete="off">
+    <p>Enter your Company ID to activate NeXus HRMS.</p>
+    <input type="text" id="licenseKeyInput" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" autocomplete="off">
     <div id="licenseMsg" class="license-msg"></div>
     <div class="license-actions">
       <button class="btn btn-primary" id="validateBtn" onclick="validateLicense()"><i class="ri-shield-check-line"></i> Validate</button>
@@ -640,6 +641,9 @@ input,select,textarea{font-family:inherit;color:inherit}
 
 <!-- ═══════ WELCOME ═══════ -->
 <div id="welcomeScreen" class="screen-overlay hidden">
+  <div class="welcome-badge">✦ Licensed</div>
+  <div class="welcome-title font-display">Welcome to <span class="welcome-company" id="welcomeCompanyName"></span></div>
+  <div class="welcome-sub">Let's set up your HRMS</div>
 </div>
 
 <!-- ═══════ SETUP: THEME ═══════ -->
@@ -3500,7 +3504,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 
   /* ── Default settings: Pakistan timezone ── */
   const PKT_TZ = 'Asia/Karachi';
-  const SHIFT_START_HOUR = 13; // 5pm PKT — Clock In opens
+  const SHIFT_START_HOUR = 17; // 5pm PKT — Clock In opens
   const SHIFT_END_HOUR   = 6;  // 6am PKT — Clock Out closes
 
   /* Get current Pakistan time as {h,m,s,minutes} regardless of device TZ */
