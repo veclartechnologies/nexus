@@ -215,13 +215,13 @@ input,select,textarea{font-family:inherit;color:inherit}
 
 /* ─── LOADING SCREEN ─── */
 #loadingScreen{gap:20px;flex-direction:column}
-.loading-circle-wrap{position:relative;width:160px;height:160px;display:flex;align-items:center;justify-content:center}
-.loading-circle-svg{width:160px;height:160px;transform:rotate(-90deg)}
+.loading-circle-wrap{position:relative;width:min(160px,40vw);height:min(160px,40vw);display:flex;align-items:center;justify-content:center}
+.loading-circle-svg{width:100%;height:100%;transform:rotate(-90deg)}
 .loading-circle-track{fill:none;stroke:rgba(var(--border),.6);stroke-width:8}
 .loading-circle-fill{fill:none;stroke:rgb(var(--accent));stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .15s linear}
-.loading-circle-pct{position:absolute;font-family:'Space Grotesk',sans-serif;font-size:2.4rem;font-weight:800;color:rgb(var(--accent));letter-spacing:-0.02em}
-.loading-welcome{font-family:'Space Grotesk',sans-serif;font-size:1.4rem;font-weight:700;color:rgb(var(--text-primary));margin-bottom:4px;text-align:center}
-.loading-sub{font-size:.85rem;color:rgb(var(--text-muted));text-align:center}
+.loading-circle-pct{position:absolute;font-family:'Space Grotesk',sans-serif;font-size:clamp(1.4rem,6vw,2.4rem);font-weight:800;color:rgb(var(--accent));letter-spacing:-0.02em}
+.loading-welcome{font-family:'Space Grotesk',sans-serif;font-size:clamp(1rem,4vw,1.4rem);font-weight:700;color:rgb(var(--text-primary));margin-bottom:4px;text-align:center;padding:0 16px}
+.loading-sub{font-size:clamp(.75rem,3vw,.85rem);color:rgb(var(--text-muted));text-align:center;padding:0 16px}
 /* keep legacy classes harmless if referenced */
 .loading-bar-wrapper{display:none}
 .loading-bar-fill{display:none}
@@ -283,10 +283,10 @@ input,select,textarea{font-family:inherit;color:inherit}
 .sidebar-backdrop.active{display:block;opacity:1}
 
 /* ─── DASHBOARD CONTENT ─── */
-.dash-content{padding:24px;max-width:1400px;width:100%;box-sizing:border-box}
+.dash-content{padding:0 24px 24px;max-width:100%;width:100%;box-sizing:border-box}
 .dash-page{display:none;animation:fadeSlideUp .4s ease-out}
 .dash-page.active{display:block}
-.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px}
+.page-header{display:flex;align-items:center;justify-content:space-between;margin:0 -24px 24px;padding:18px 24px;flex-wrap:wrap;gap:12px;background:rgb(var(--bg-card));border-bottom:1px solid rgba(var(--border))}
 .page-title{font-family:'Space Grotesk',sans-serif;font-size:1.5rem;font-weight:700}
 .page-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 
@@ -581,7 +581,8 @@ input,select,textarea{font-family:inherit;color:inherit}
   .chart-grid{grid-template-columns:1fr}
   .modal-content{padding:24px 20px}
   .modal-two-col-grid{grid-template-columns:1fr}
-  .dash-content{padding:16px}
+  .dash-content{padding:0 16px 16px}
+  .page-header{margin:0 -16px 20px;padding:14px 16px}
   .data-table-wrapper{overflow-x:auto}
   .att-emp-cards{grid-template-columns:1fr}
 }
@@ -1503,6 +1504,18 @@ function buildDashboardPages(){
           </button>
         </div>
       </div>
+
+      <!-- EMPLOYEE ATTENDANCE CALENDAR (3D carousel) -->
+      <div class="emp-att-cal-wrap">
+        <div class="emp-att-cal-head">
+          <h3 class="emp-att-cal-title"><i class="ri-calendar-2-line"></i> My Attendance</h3>
+          <div class="emp-att-cal-tabs">
+            <button class="att-cal-tab active" data-range="upcoming" onclick="setEmpAttRange('upcoming')">Next 30 days</button>
+            <button class="att-cal-tab" data-range="past" onclick="setEmpAttRange('past')">Last 3 months</button>
+          </div>
+        </div>
+        <div class="carousel3d" id="empAttCarousel"></div>
+      </div>
       `}
     </div>
 
@@ -1616,13 +1629,19 @@ function buildDashboardPages(){
       <div class="page-header"><h1 class="page-title">Requests</h1>
         ${!isAdmin?'<div class="page-actions"><button class="btn btn-primary" style="padding:8px 16px;font-size:.82rem" onclick="showSubmitRequestModal()"><i class="ri-add-line"></i> Submit Request</button></div>':''}
       </div>
+      ${isAdmin?`
       <div class="data-table-wrapper">
         <div class="data-table-header">
           <div class="data-table-title">Employee Requests</div>
           <div class="data-table-actions"><input type="text" class="search-input" placeholder="Search..." id="reqSearch" oninput="renderRequests()"></div>
         </div>
-        <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Employee</th><th>Department</th><th>Type</th><th>Details</th><th>Date</th><th>Status</th>${isAdmin?'<th>Actions</th>':''}</tr></thead><tbody id="reqTableBody"></tbody></table></div>
-      </div>
+        <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Employee</th><th>Department</th><th>Type</th><th>Details</th><th>Date</th><th>Status</th><th>Actions</th></tr></thead><tbody id="reqTableBody"></tbody></table></div>
+      </div>`:`
+      <div class="emp-carousel-wrap">
+        <div class="data-table-actions" style="margin-bottom:14px"><input type="text" class="search-input" placeholder="Search your requests..." id="reqSearch" oninput="renderRequests()" style="width:100%;max-width:360px"></div>
+        <div class="carousel3d" id="reqCarousel"></div>
+        <tbody id="reqTableBody" style="display:none"></tbody>
+      </div>`}
     </div>
 
     <!-- SETTINGS -->
@@ -2072,7 +2091,63 @@ function initEmployeeClock(){
   empWageInterval=setInterval(()=>{
     if(session&&session.employeeId)updateEmpStats(session.employeeId);
   },30000);
+
+  // Render personal attendance calendar carousel
+  renderEmpAttCarousel();
 }
+
+let empAttRange='upcoming';
+function setEmpAttRange(range){
+  empAttRange=range;
+  document.querySelectorAll('.att-cal-tab').forEach(t=>t.classList.toggle('active',t.dataset.range===range));
+  renderEmpAttCarousel();
+}
+function isWeekendDate(d){const w=d.getDay();return w===0||w===6}
+function renderEmpAttCarousel(){
+  const el=nexus$('empAttCarousel');if(!el)return;
+  const session=(typeof getSession==='function')?getSession():null;
+  const myId=session&&session.employeeId?String(session.employeeId):'';
+  const myRecs={};
+  attendanceRecords.forEach(r=>{
+    if(String(r.employeeId)===myId) myRecs[r.date]=r;
+  });
+  const today=new Date();today.setHours(0,0,0,0);
+  let days=[];
+  if(empAttRange==='upcoming'){
+    for(let i=0;i<30;i++){const d=new Date(today);d.setDate(today.getDate()+i);days.push(d);}
+  } else {
+    for(let i=1;i<=90;i++){const d=new Date(today);d.setDate(today.getDate()-i);days.push(d);}
+  }
+  el.innerHTML=days.map(d=>{
+    const iso=d.toISOString().split('T')[0];
+    const rec=myRecs[iso];
+    const dayName=d.toLocaleDateString('en-US',{weekday:'short'});
+    const dateLabel=d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    const isFuture=d>today;
+    const weekend=isWeekendDate(d);
+    let badgeHtml='', body='';
+    if(weekend){
+      badgeHtml='<span class="c3d-badge" style="background:rgba(99,102,241,.15);color:#a5b4fc">Weekend</span>';
+      body='<div class="c3d-desc" style="text-align:center;padding-top:14px">Enjoy your day off 🌴</div>';
+    } else if(rec){
+      const cls=rec.status==='Present'?'badge-active':rec.status==='Late'?'badge-pending':'badge-rejected';
+      badgeHtml=`<span class="c3d-badge status-badge ${cls}">${rec.status||'—'}</span>`;
+      body=`
+        <div class="c3d-row"><span class="c3d-label">Check In</span><span class="c3d-val">${rec.checkIn||'—'}</span></div>
+        <div class="c3d-row"><span class="c3d-label">Check Out</span><span class="c3d-val">${rec.checkOut||'—'}</span></div>
+        <div class="c3d-row"><span class="c3d-label">Hours</span><span class="c3d-val">${rec.totalHours||'0'}</span></div>
+        ${rec.deduction?`<div class="c3d-row"><span class="c3d-label">Deduction</span><span class="c3d-val" style="color:rgb(var(--danger))">PKR ${rec.deduction}</span></div>`:''}`;
+    } else if(isFuture){
+      badgeHtml='<span class="c3d-badge" style="background:rgba(var(--border),.4);color:rgb(var(--text-muted))">Upcoming</span>';
+      body='<div class="c3d-desc" style="text-align:center;padding-top:14px">Scheduled work day</div>';
+    } else {
+      badgeHtml='<span class="c3d-badge badge-rejected">Absent</span>';
+      body='<div class="c3d-desc" style="text-align:center;padding-top:14px">No record found</div>';
+    }
+    return `<div class="carousel3d-card"><div class="c3d-head"><div><span class="c3d-day">${dayName}</span><div class="c3d-date">${dateLabel}</div></div>${badgeHtml}</div>${body}</div>`;
+  }).join('');
+}
+window.setEmpAttRange=setEmpAttRange;
 
 async function checkBiometricStatus(empId) {
   try {
@@ -2826,11 +2901,38 @@ async function loadRequests(){
 }
 
 function renderRequests(){
-  const tbody=nexus$('reqTableBody');if(!tbody)return;
+  const tbody=nexus$('reqTableBody');
+  const carousel=nexus$('reqCarousel');
   const search=(nexus$('reqSearch')?nexus$('reqSearch').value:'').toLowerCase();
   const isAdmin=DASH.role!=='employee';
-  let reqs=requestRecords.filter(r=>!search||r.employeeName.toLowerCase().includes(search)||r.type.toLowerCase().includes(search));
-  tbody.innerHTML=reqs.map(r=>`<tr><td>${r.employeeName}</td><td>${r.department}</td><td>${r.type}</td><td>${r.details}</td><td>${formatDate(r.startDate)}</td><td><span class="status-badge ${r.status==='Approved'?'badge-approved':r.status==='Rejected'?'badge-rejected':'badge-pending'}">${r.status}</span></td>${isAdmin?`<td style="display:flex;gap:4px">${r.status==='Pending'?`<button class="btn btn-ghost" style="padding:4px 8px;font-size:.72rem;color:rgb(var(--accent3))" onclick="handleReq('${r.requestId}','approve')">Approve</button><button class="btn btn-ghost" style="padding:4px 8px;font-size:.72rem;color:rgb(var(--danger))" onclick="handleReqWithReason('${r.requestId}')">Reject</button>`:'<span style="font-size:.72rem;color:rgb(var(--text-muted))">Done</span>'}</td>`:''}</tr>`).join('')||'<tr><td colspan="7" style="text-align:center;color:rgb(var(--text-muted));padding:32px">No requests</td></tr>';
+  const session=(typeof getSession==='function')?getSession():null;
+  const myId=session&&session.employeeId?String(session.employeeId):'';
+  const myName=session&&session.employeeName?String(session.employeeName).toLowerCase():'';
+  let reqs=requestRecords.slice();
+  if(!isAdmin){
+    reqs=reqs.filter(r=>{
+      const ridStr=r.employeeId!=null?String(r.employeeId):'';
+      const rNameStr=(r.employeeName||'').toLowerCase();
+      return (myId && ridStr===myId) || (myName && rNameStr===myName);
+    });
+  }
+  reqs=reqs.filter(r=>!search||(r.employeeName||'').toLowerCase().includes(search)||(r.type||'').toLowerCase().includes(search)||(r.details||'').toLowerCase().includes(search));
+
+  if(tbody){
+    tbody.innerHTML=reqs.map(r=>`<tr><td>${r.employeeName}</td><td>${r.department}</td><td>${r.type}</td><td>${r.details}</td><td>${formatDate(r.startDate)}</td><td><span class="status-badge ${r.status==='Approved'?'badge-approved':r.status==='Rejected'?'badge-rejected':'badge-pending'}">${r.status}</span></td>${isAdmin?`<td style="display:flex;gap:4px">${r.status==='Pending'?`<button class="btn btn-ghost" style="padding:4px 8px;font-size:.72rem;color:rgb(var(--accent3))" onclick="handleReq('${r.requestId}','approve')">Approve</button><button class="btn btn-ghost" style="padding:4px 8px;font-size:.72rem;color:rgb(var(--danger))" onclick="handleReqWithReason('${r.requestId}')">Reject</button>`:'<span style="font-size:.72rem;color:rgb(var(--text-muted))">Done</span>'}</td>`:''}</tr>`).join('')||`<tr><td colspan="${isAdmin?7:6}" style="text-align:center;color:rgb(var(--text-muted));padding:32px">No requests</td></tr>`;
+  }
+  if(carousel){
+    carousel.innerHTML=reqs.length?reqs.map(r=>{
+      const cls=r.status==='Approved'?'badge-approved':r.status==='Rejected'?'badge-rejected':'badge-pending';
+      return `<div class="carousel3d-card">
+        <div class="c3d-head"><span class="c3d-type">${r.type||'Request'}</span><span class="c3d-badge status-badge ${cls}">${r.status||'Pending'}</span></div>
+        <div class="c3d-title">${formatDate(r.startDate)||''}</div>
+        <div class="c3d-desc">${(r.details||'').replace(/</g,'&lt;')}</div>
+        <div class="c3d-row"><span class="c3d-label">Department</span><span class="c3d-val">${r.department||'—'}</span></div>
+        <div class="c3d-row"><span class="c3d-label">Submitted</span><span class="c3d-val">${formatDate(r.timestamp||r.startDate)||'—'}</span></div>
+      </div>`;
+    }).join(''):'<div class="carousel3d-card empty"><div class="c3d-title">No requests yet</div><div class="c3d-desc">Tap "Submit Request" to create one.</div></div>';
+  }
 }
 
 async function handleReq(id,action,reason){
@@ -3993,10 +4095,39 @@ document.addEventListener('DOMContentLoaded',()=>{
     /* Offline indicator */
     .offline-pill{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:11500;background:rgba(239,68,68,.95);color:#fff;padding:6px 14px;border-radius:999px;font-size:.74rem;font-weight:600;display:none;align-items:center;gap:6px;box-shadow:0 4px 14px rgba(0,0,0,.3);animation:vfade .25s ease}
     body.is-offline .offline-pill{display:inline-flex}
-    .queue-pill{position:fixed;top:10px;right:10px;z-index:11500;background:rgba(var(--accent),.95);color:#000;padding:5px 12px;border-radius:999px;font-size:.7rem;font-weight:700;display:none}
-    body.has-queue .queue-pill{display:inline-block}
+     .queue-pill{display:none!important}
+     body.has-queue .queue-pill{display:none!important}
 
-    /* Toast */
+     /* 3D Horizontal Carousel */
+     .carousel3d{display:flex;gap:16px;overflow-x:auto;scroll-snap-type:x mandatory;padding:30px 16px 36px;perspective:1200px;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
+     .carousel3d::-webkit-scrollbar{height:6px}
+     .carousel3d::-webkit-scrollbar-thumb{background:rgba(var(--accent),.4);border-radius:3px}
+     .carousel3d-card{flex:0 0 280px;scroll-snap-align:center;background:rgb(var(--bg-card));border:1px solid rgba(var(--border));border-radius:18px;padding:18px;box-shadow:0 12px 28px rgba(0,0,0,.25);transform:rotateY(-6deg) scale(.95);transition:transform .35s ease,box-shadow .35s ease,border-color .25s;transform-style:preserve-3d;cursor:grab}
+     .carousel3d-card:hover{transform:rotateY(0) scale(1);box-shadow:0 18px 40px rgba(0,0,0,.35);border-color:rgba(var(--accent),.5)}
+     .carousel3d-card.empty{opacity:.6;text-align:center}
+     .c3d-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:8px}
+     .c3d-date{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:.95rem;color:rgb(var(--accent))}
+     .c3d-day{font-size:.7rem;color:rgb(var(--text-muted));text-transform:uppercase;letter-spacing:.08em}
+     .c3d-row{display:flex;justify-content:space-between;align-items:center;font-size:.78rem;padding:6px 0;border-bottom:1px dashed rgba(var(--border),.5)}
+     .c3d-row:last-child{border-bottom:none}
+     .c3d-label{color:rgb(var(--text-muted))}
+     .c3d-val{font-weight:600;color:rgb(var(--text-primary))}
+     .c3d-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.68rem;font-weight:700}
+     .c3d-type{font-size:.7rem;color:rgb(var(--text-muted));text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+     .c3d-title{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:1rem;margin-bottom:6px;color:rgb(var(--text-primary))}
+     .c3d-desc{font-size:.78rem;color:rgb(var(--text-secondary));line-height:1.4;margin:6px 0;min-height:38px}
+     .emp-att-cal-wrap{margin-top:32px;background:rgb(var(--bg-card));border:1px solid rgba(var(--border));border-radius:16px;padding:18px}
+     .emp-att-cal-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:6px}
+     .emp-att-cal-title{font-family:'Space Grotesk',sans-serif;font-size:1.1rem;font-weight:700;display:flex;align-items:center;gap:8px}
+     .emp-att-cal-tabs{display:flex;gap:6px;background:rgba(var(--bg),.5);padding:4px;border-radius:10px}
+     .att-cal-tab{background:transparent;border:none;color:rgb(var(--text-muted));padding:6px 14px;border-radius:8px;font-size:.78rem;font-weight:600;cursor:pointer;transition:.2s}
+     .att-cal-tab.active{background:rgb(var(--accent));color:#000}
+     .emp-carousel-wrap{padding:6px 0}
+     @media(max-width:600px){
+       .carousel3d-card{flex-basis:78vw;padding:16px}
+       .carousel3d{padding:24px 12px 30px}
+     }
+
     .nx-toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:rgb(var(--bg-card));color:rgb(var(--text-primary));border:1px solid rgba(var(--border));padding:10px 18px;border-radius:12px;font-size:.85rem;z-index:12000;box-shadow:0 10px 30px rgba(0,0,0,.4);opacity:0;transition:opacity .25s;pointer-events:none}
     .nx-toast.show{opacity:1}
 
