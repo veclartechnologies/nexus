@@ -216,12 +216,13 @@ input,select,textarea{font-family:inherit;color:inherit}
 /* ─── LOADING SCREEN ─── */
 #loadingScreen{gap:20px;flex-direction:column}
 .loading-circle-wrap{position:relative;width:min(160px,40vw);height:min(160px,40vw);display:flex;align-items:center;justify-content:center}
-.loading-circle-svg{width:100%;height:100%;transform:rotate(-90deg)}
+.loading-circle-svg{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);transform-origin:center;animation:loadSpin 2.4s linear infinite;will-change:transform}
 .loading-circle-track{fill:none;stroke:rgba(var(--border),.6);stroke-width:8}
-.loading-circle-fill{fill:none;stroke:rgb(var(--accent));stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .15s linear}
-.loading-circle-pct{position:absolute;font-family:'Space Grotesk',sans-serif;font-size:clamp(1.4rem,6vw,2.4rem);font-weight:800;color:rgb(var(--accent));letter-spacing:-0.02em}
+.loading-circle-fill{fill:none;stroke:rgb(var(--accent));stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .15s linear;will-change:stroke-dashoffset}
+.loading-circle-pct{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-family:'Space Grotesk',sans-serif;font-size:clamp(1.4rem,6vw,2.4rem);font-weight:800;color:rgb(var(--accent));letter-spacing:-0.02em;line-height:1;z-index:1}
 .loading-welcome{font-family:'Space Grotesk',sans-serif;font-size:clamp(1rem,4vw,1.4rem);font-weight:700;color:rgb(var(--text-primary));margin-bottom:4px;text-align:center;padding:0 16px}
 .loading-sub{font-size:clamp(.75rem,3vw,.85rem);color:rgb(var(--text-muted));text-align:center;padding:0 16px}
+@keyframes loadSpin{to{transform:rotate(270deg)}}
 /* keep legacy classes harmless if referenced */
 .loading-bar-wrapper{display:none}
 .loading-bar-fill{display:none}
@@ -1529,7 +1530,8 @@ function buildDashboardPages(){
 
     <!-- Biometric Registration Overlay -->
     <div class="bio-reg-overlay" id="bioRegOverlay">
-      <div class="bio-reg-card">
+      <div class="bio-reg-card" style="position:relative">
+        <button class="modal-close-btn" type="button" aria-label="Close" onclick="closeBioRegOverlay()"><i class="ri-close-line"></i></button>
         <div class="bio-reg-icon" id="bioRegIcon"><i class="ri-fingerprint-line"></i></div>
         <h2 id="bioRegTitle">Register Your Fingerprint</h2>
         <p id="bioRegDesc">First-time biometric setup is required for secure attendance logging. Your fingerprint data stays on your device.</p>
@@ -2267,7 +2269,13 @@ function showBiometricRegistration(pendingClockType) {
   });
 }
 
-async function startBiometricRegistration() {
+function closeBioRegOverlay(){
+  const ov = nexus$('bioRegOverlay');
+  if(ov){ ov.classList.remove('active'); ov.dataset.pendingType=''; }
+  try{ pendingClockType = null; }catch(e){}
+}
+
+
   const btn = nexus$('bioRegBtn');
   btn.disabled = true;
   btn.innerHTML = dots();
