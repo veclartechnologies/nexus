@@ -600,6 +600,7 @@ input,select,textarea{font-family:inherit;color:inherit}
 <!-- ═══════ SPLASH ═══════ -->
 <div id="splashScreen" class="screen-overlay">
   <div class="splash-logo"><span class="ne">Ne</span><span class="x">X</span><span class="us">us</span></div>
+  <div class="splash-sub">Human Resource Management</div>
 </div>
 
 <!-- ═══════ LICENSE SCREEN ═══════ -->
@@ -607,8 +608,8 @@ input,select,textarea{font-family:inherit;color:inherit}
   <div class="license-container">
     <div class="license-icon"><i class="ri-key-2-line"></i></div>
     <h1 class="font-display">Company ID</h1>
-    <p>Enter your Company ID to activate NeXus.</p>
-    <input type="text" id="licenseKeyInput" class="input-field" placeholder="XXXXXX" autocomplete="off">
+    <p>Enter your Company ID to activate NeXus HRMS.</p>
+    <input type="text" id="licenseKeyInput" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" autocomplete="off">
     <div id="licenseMsg" class="license-msg"></div>
     <div class="license-actions">
       <button class="btn btn-primary" id="validateBtn" onclick="validateLicense()"><i class="ri-shield-check-line"></i> Validate</button>
@@ -639,7 +640,9 @@ input,select,textarea{font-family:inherit;color:inherit}
 
 <!-- ═══════ WELCOME ═══════ -->
 <div id="welcomeScreen" class="screen-overlay hidden">
+  <div class="welcome-badge">✦ Licensed</div>
   <div class="welcome-title font-display">Welcome to <span class="welcome-company" id="welcomeCompanyName"></span></div>
+  <div class="welcome-sub">Let's set up your HRMS</div>
 </div>
 
 <!-- ═══════ SETUP: THEME ═══════ -->
@@ -766,7 +769,7 @@ input,select,textarea{font-family:inherit;color:inherit}
     <div id="forgotStep2" style="display:none">
       <h2>Verify Your Company ID</h2>
       <p style="color:rgb(var(--text-secondary));margin-bottom:16px">Enter your Company ID to reset your <span id="forgotFieldLabel">username</span>.</p>
-      <input type="text" id="forgotLicenseKey" class="input-field" placeholder="XXXXXX" style="margin-bottom:12px">
+      <input type="text" id="forgotLicenseKey" class="input-field" placeholder="NX-XXXX-XXXX-XXXXXX" style="margin-bottom:12px">
       <div id="forgotMsg" class="license-msg"></div>
       <div class="modal-actions" style="margin-top:16px">
         <button class="btn btn-secondary" onclick="forgotGoBack()">Back</button>
@@ -795,6 +798,7 @@ input,select,textarea{font-family:inherit;color:inherit}
     </svg>
     <div class="loading-circle-pct" id="loadingPct">0%</div>
   </div>
+  <div class="loading-sub" id="loadingSub" style="display:none"></div>
   <!-- legacy bar kept hidden for backward compatibility -->
   <div class="loading-bar-wrapper" style="display:none"><div class="loading-bar-fill" id="loadingBar"></div></div>
 </div>
@@ -824,6 +828,7 @@ input,select,textarea{font-family:inherit;color:inherit}
     <!-- Main -->
     <div class="dash-main" id="dashMain">
       <div class="dash-topbar" id="dashTopbar">
+        <button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()"><i class="ri-menu-line"></i></button>
         <div class="dash-topbar-logo">Ne<span class="x">X</span>us</div>
         <div class="dash-topbar-nav" id="topbarNav"></div>
         <div class="dash-topbar-right">
@@ -2032,7 +2037,7 @@ function showAuditTrailModal(empId,empName){
 
 /* ── Employee: Live Clock + WebAuthn Biometric ── */
 let bioFailedAttempts = 0;
-const BIO_MAX_ATTEMPTS = 99;
+const BIO_MAX_ATTEMPTS = 3;
 let bioLocked = false;
 let bioCancelled = false;
 let empCredentialId = null; // cached from backend
@@ -2857,7 +2862,18 @@ function showSubmitRequestModal(){
 async function submitRequest(){
   const btn=nexus$('srBtn');btn.disabled=true;btn.innerHTML=dots();
   try{
-    const d=await apiPost({action:'handleRequest',licenseKey:STATE.licenseKey,action:'submit',type:nexus$('srType').value,details:nexus$('srDetails').value.trim(),date:nexus$('srDate').value});
+    const session=getSession()||{};
+    const emp=DASH.employees.find(e=>e.id===session.employeeId)||{};
+    const d=await apiPost({
+      action:'submitRequest',
+      licenseKey:STATE.licenseKey,
+      employeeId:session.employeeId||'',
+      employeeName:session.employeeName||session.username||emp.name||'',
+      department:emp.department||'',
+      type:nexus$('srType').value,
+      details:nexus$('srDetails').value.trim(),
+      date:nexus$('srDate').value
+    });
     if(d.success){setMsg('srMsg','Submitted!','success');setTimeout(()=>{closeGenericModal();loadRequests()},800)}
     else{setMsg('srMsg',d.error||'Failed.','error');btn.disabled=false;btn.innerHTML='<i class="ri-check-line"></i> Submit'}
   }catch(e){setMsg('srMsg','Network error.','error');btn.disabled=false;btn.innerHTML='<i class="ri-check-line"></i> Submit'}
@@ -3803,7 +3819,7 @@ document.addEventListener('DOMContentLoaded',()=>{
       const name = (s && (s.employeeName || s.username)) || STATE.username || '';
       if (wEl) wEl.textContent = name ? ('Welcome back, ' + String(name).split(' ')[0]) : 'Welcome back';
     } catch(e){}
-    if (subEl) subEl.textContent = 'Preparing your workspace…';
+    if (subEl) subEl.textContent = '';
 
     function paint(p){
       if (pctEl) pctEl.textContent = Math.round(p) + '%';
@@ -3811,14 +3827,13 @@ document.addEventListener('DOMContentLoaded',()=>{
     }
     paint(0);
 
-    // Counter animates exactly +1 every ~28ms (≈2.8s for 0→100), capped at 92
-    // until preload finishes, then accelerated to 100.
+    // Smooth, even ramp 0→100 over ~3.5s. Don't cap mid-way; preload runs
+    // in parallel and is awaited before transitioning to the dashboard.
     let preloadDone = false;
     const tick = setInterval(()=>{
-      const cap = preloadDone ? 100 : 92;
-      if (pct < cap) { pct += 1; paint(pct); }
-      if (pct >= 100) { clearInterval(tick); finish(); }
-    }, 28);
+      if (pct < 100) { pct += 1; paint(pct); }
+      if (pct >= 100) { clearInterval(tick); if (preloadDone) finish(); }
+    }, 35);
 
     let finished = false;
     function finish(){
@@ -3874,7 +3889,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     // Minimum visible time so the animation feels intentional
     tasks.push(new Promise(r=>setTimeout(r, 600)));
 
-    Promise.all(tasks).finally(()=>{ preloadDone = true; });
+    Promise.all(tasks).finally(()=>{ preloadDone = true; if (pct >= 100) finish(); });
   };
 
   /* ── (d) Mobile sidebar hamburger, Clear Session relocation, Setup hide ── */
@@ -3952,6 +3967,444 @@ document.addEventListener('DOMContentLoaded',()=>{
   document.head.appendChild(mobStyle);
 })();
 
+/* ═══════════════════════════════════════════════════════════════════════
+   ▼▼▼ NEXUS v1.06 AMENDMENTS — Verification anims · Bottom nav · Offline
+   queue · Settings tab · Biometric retry · Request fix
+   ═══════════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+
+  /* ── Styles ── */
+  const css = document.createElement('style');
+  css.textContent = `
+    /* (a) Verification overlay (login + license) */
+    .verify-overlay{position:fixed;inset:0;z-index:11000;display:none;align-items:center;justify-content:center;background:rgba(8,8,18,.78);backdrop-filter:blur(14px);animation:vfade .25s ease}
+    .verify-overlay.active{display:flex}
+    @keyframes vfade{from{opacity:0}to{opacity:1}}
+    .verify-card{background:rgb(var(--bg-card));border:1px solid rgba(var(--border));border-radius:20px;padding:36px 28px;display:flex;flex-direction:column;align-items:center;gap:16px;min-width:260px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+    .verify-ring{position:relative;width:84px;height:84px}
+    .verify-ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+    .verify-ring .vt{fill:none;stroke:rgba(var(--border),.6);stroke-width:6}
+    .verify-ring .vf{fill:none;stroke:rgb(var(--accent));stroke-width:6;stroke-linecap:round;stroke-dasharray:226;stroke-dashoffset:226;animation:vspin 1.4s linear infinite}
+    @keyframes vspin{0%{stroke-dashoffset:226;transform:rotate(0)}50%{stroke-dashoffset:60}100%{stroke-dashoffset:226;transform:rotate(360deg)}}
+    .verify-ring .vcheck{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgb(var(--accent));font-size:36px;opacity:0;transform:scale(.6);transition:all .35s cubic-bezier(.5,1.7,.4,1)}
+    .verify-overlay.success .vcheck{opacity:1;transform:scale(1)}
+    .verify-overlay.success .vf{animation:none;stroke-dashoffset:0;transition:stroke-dashoffset .4s}
+    .verify-title{font-family:'Space Grotesk',sans-serif;font-size:1.05rem;font-weight:700;color:rgb(var(--text-primary));text-align:center}
+    .verify-sub{font-size:.82rem;color:rgb(var(--text-muted));text-align:center}
+
+    /* (d) Native bottom navigation (mobile, employee dashboard) */
+    .bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgb(var(--bg-card));border-top:1px solid rgba(var(--border));display:none;justify-content:space-around;align-items:stretch;z-index:9997;padding:6px 4px calc(6px + env(safe-area-inset-bottom));box-shadow:0 -4px 20px rgba(0,0,0,.18)}
+    .bottom-nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:8px 4px;background:none;border:none;color:rgb(var(--text-muted));font-family:inherit;font-size:.68rem;font-weight:600;cursor:pointer;transition:color .2s;border-radius:10px;min-height:54px}
+    .bottom-nav-item i{font-size:22px;line-height:1}
+    .bottom-nav-item.active{color:rgb(var(--accent))}
+    .bottom-nav-item:active{background:rgba(var(--accent),.08)}
+    body.has-bottom-nav .dash-main{padding-bottom:80px !important}
+    body.has-bottom-nav #mobileMenuBtn{display:none !important}
+    body.has-bottom-nav .dash-topbar{display:none !important}
+    body.has-bottom-nav .dash-sidebar{transform:translateX(-100%) !important}
+
+    /* Show bottom nav only on mobile + employee */
+    @media (max-width:768px){
+      body.bn-on .bottom-nav{display:flex}
+      body.bn-on{padding-bottom:0}
+    }
+
+    /* (d) Hide hamburger when topbar layout selected */
+    body.layout-topbar #mobileMenuBtn{display:none !important}
+    body.layout-topbar .dash-layout-topbar .sidebar-toggle{display:none !important}
+
+    /* Offline indicator */
+    .offline-pill{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:11500;background:rgba(239,68,68,.95);color:#fff;padding:6px 14px;border-radius:999px;font-size:.74rem;font-weight:600;display:none;align-items:center;gap:6px;box-shadow:0 4px 14px rgba(0,0,0,.3);animation:vfade .25s ease}
+    body.is-offline .offline-pill{display:inline-flex}
+    .queue-pill{position:fixed;top:10px;right:10px;z-index:11500;background:rgba(var(--accent),.95);color:#000;padding:5px 12px;border-radius:999px;font-size:.7rem;font-weight:700;display:none}
+    body.has-queue .queue-pill{display:inline-block}
+
+    /* Toast */
+    .nx-toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:rgb(var(--bg-card));color:rgb(var(--text-primary));border:1px solid rgba(var(--border));padding:10px 18px;border-radius:12px;font-size:.85rem;z-index:12000;box-shadow:0 10px 30px rgba(0,0,0,.4);opacity:0;transition:opacity .25s;pointer-events:none}
+    .nx-toast.show{opacity:1}
+
+    /* Settings tab biometric card */
+    .bio-settings-card{background:rgb(var(--bg-card));border:1px solid rgba(var(--border));border-radius:14px;padding:22px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+    .bio-settings-icon{width:54px;height:54px;border-radius:14px;background:rgba(var(--accent),.12);color:rgb(var(--accent));display:flex;align-items:center;justify-content:center;font-size:26px;flex-shrink:0}
+    .bio-settings-info{flex:1;min-width:200px}
+    .bio-settings-title{font-weight:700;color:rgb(var(--text-primary));margin-bottom:3px}
+    .bio-settings-desc{font-size:.8rem;color:rgb(var(--text-muted))}
+    .bio-settings-status{font-size:.75rem;font-weight:600;padding:4px 10px;border-radius:999px;display:inline-block;margin-top:6px}
+    .bio-settings-status.registered{background:rgba(34,197,94,.15);color:#22c55e}
+    .bio-settings-status.unregistered{background:rgba(245,158,11,.15);color:#f59e0b}
+  `;
+  document.head.appendChild(css);
+
+  /* ── (a) Verification overlay helpers ── */
+  function ensureVerifyOverlay(){
+    let el = document.getElementById('nxVerifyOverlay');
+    if(el) return el;
+    el = document.createElement('div');
+    el.id = 'nxVerifyOverlay'; el.className='verify-overlay';
+    el.innerHTML = `<div class="verify-card">
+      <div class="verify-ring">
+        <svg viewBox="0 0 80 80"><circle class="vt" cx="40" cy="40" r="36"/><circle class="vf" cx="40" cy="40" r="36"/></svg>
+        <div class="vcheck"><i class="ri-check-line"></i></div>
+      </div>
+      <div class="verify-title" id="nxVerifyTitle">Verifying…</div>
+      <div class="verify-sub" id="nxVerifySub">Please wait</div>
+    </div>`;
+    document.body.appendChild(el);
+    return el;
+  }
+  function showVerify(title, sub){
+    const el = ensureVerifyOverlay();
+    el.classList.remove('success');
+    document.getElementById('nxVerifyTitle').textContent = title || 'Verifying…';
+    document.getElementById('nxVerifySub').textContent = sub || '';
+    el.classList.add('active');
+  }
+  function verifySuccess(title, sub, hideAfter){
+    const el = ensureVerifyOverlay();
+    document.getElementById('nxVerifyTitle').textContent = title || 'Verified';
+    document.getElementById('nxVerifySub').textContent = sub || '';
+    el.classList.add('success');
+    setTimeout(()=>el.classList.remove('active','success'), hideAfter||700);
+  }
+  function hideVerify(){ const el=document.getElementById('nxVerifyOverlay'); if(el) el.classList.remove('active','success'); }
+  window.nxShowVerify = showVerify; window.nxVerifySuccess = verifySuccess; window.nxHideVerify = hideVerify;
+
+  /* Wrap validateLicense + doLogin to show verification animation */
+  const _origValidate = window.validateLicense;
+  if(typeof _origValidate === 'function'){
+    window.validateLicense = async function(){
+      const key = document.getElementById('licenseKeyInput');
+      if(!key || !key.value.trim()) return _origValidate.apply(this, arguments);
+      showVerify('Validating License', 'Verifying your company ID…');
+      try{ await _origValidate.apply(this, arguments); }
+      finally{
+        // If success message visible, show check then hide
+        const msg = document.getElementById('licenseMsg');
+        if(msg && msg.classList.contains('success')){ verifySuccess('License Verified', 'Welcome aboard'); }
+        else { hideVerify(); }
+      }
+    };
+  }
+  const _origLogin = window.doLogin;
+  if(typeof _origLogin === 'function'){
+    window.doLogin = async function(){
+      const u = document.getElementById('loginUsername');
+      const p = document.getElementById('loginPin');
+      if(!u || !u.value.trim() || !p || p.value.trim().length!==4) return _origLogin.apply(this, arguments);
+      showVerify('Signing In', 'Authenticating credentials…');
+      try{ await _origLogin.apply(this, arguments); }
+      finally{
+        const msg = document.getElementById('loginMsg');
+        if(msg && msg.classList.contains('success')){ verifySuccess('Login Successful', 'Welcome back'); }
+        else { hideVerify(); }
+      }
+    };
+  }
+
+  /* ── (h) Toast helper ── */
+  function showToast(text, ms){
+    let t = document.getElementById('nxToast');
+    if(!t){ t=document.createElement('div'); t.id='nxToast'; t.className='nx-toast'; document.body.appendChild(t); }
+    t.textContent = text; t.classList.add('show');
+    clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove('show'), ms||2400);
+  }
+  window.showToast = showToast;
+
+  /* ── (f) Offline queue for clock-in/out ── */
+  const QUEUE_KEY = 'nexus_clock_queue_v1';
+  function loadQueue(){ try{return JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]')}catch(e){return []} }
+  function saveQueue(q){ localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); updateQueuePill(); }
+  function enqueue(payload){ const q=loadQueue(); q.push({...payload, queuedAt:Date.now()}); saveQueue(q); }
+  function updateQueuePill(){
+    const n = loadQueue().length;
+    let p = document.getElementById('nxQueuePill');
+    if(!p){ p=document.createElement('div'); p.id='nxQueuePill'; p.className='queue-pill'; document.body.appendChild(p); }
+    p.textContent = n>0 ? (n+' pending sync') : '';
+    document.body.classList.toggle('has-queue', n>0);
+  }
+  let offlinePill = document.getElementById('nxOfflinePill');
+  if(!offlinePill){
+    offlinePill = document.createElement('div');
+    offlinePill.id='nxOfflinePill'; offlinePill.className='offline-pill';
+    offlinePill.innerHTML='<i class="ri-wifi-off-line"></i> Offline — changes will sync';
+    document.body.appendChild(offlinePill);
+  }
+  function setOnlineState(){ document.body.classList.toggle('is-offline', !navigator.onLine); if(navigator.onLine) flushQueue(); }
+  window.addEventListener('online', setOnlineState);
+  window.addEventListener('offline', setOnlineState);
+  setOnlineState();
+
+  async function flushQueue(){
+    const q = loadQueue();
+    if(!q.length) return;
+    if(typeof apiPost!=='function') return;
+    const remaining = [];
+    for(const item of q){
+      try{
+        const r = await apiPost(item.payload);
+        if(!r || !r.success) remaining.push(item);
+      }catch(e){ remaining.push(item); }
+    }
+    saveQueue(remaining);
+    if(remaining.length < q.length) showToast('Synced '+(q.length-remaining.length)+' queued action(s)');
+    if(typeof loadAttendance==='function') try{ loadAttendance(); }catch(e){}
+  }
+  window.nxFlushQueue = flushQueue;
+  setInterval(()=>{ if(navigator.onLine) flushQueue(); }, 30000);
+  updateQueuePill();
+
+  /* Override the v1.05 processClockAction to be offline-aware + optimistic */
+  const _v105ProcessClock = window.processClockAction;
+  window.processClockAction = async function(type){
+    const session = (typeof getSession==='function') ? getSession() : null;
+    if(!session || !session.employeeId) return;
+
+    // Compute PKT time (HH:MM:SS) using same formatter as v1.05 layer
+    const pktFmt = new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Karachi',hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date());
+    const dateStr = new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Karachi'}).format(new Date());
+    const emp = (window.DASH && DASH.employees) ? DASH.employees.find(e=>e.id===session.employeeId) || {} : {};
+
+    // Optimistic UI immediately
+    if(type==='in'){
+      const btn = document.getElementById('empClockInBtn');
+      const outBtn = document.getElementById('empClockOutBtn');
+      window.todayCheckins = window.todayCheckins || {};
+      window.todayCheckins[session.employeeId] = { checkIn:pktFmt, checkOut:'', hours:0, status:'Present' };
+      if(btn){ btn.disabled=true; btn.innerHTML='<i class="ri-check-line" style="font-size:32px"></i><span>Clocked In</span>'; }
+      if(outBtn) outBtn.disabled=false;
+    } else {
+      const btn = document.getElementById('empClockOutBtn');
+      const inBtn = document.getElementById('empClockInBtn');
+      window.todayCheckins = window.todayCheckins || {};
+      const ci = window.todayCheckins[session.employeeId] || {};
+      ci.checkOut = pktFmt; window.todayCheckins[session.employeeId] = ci;
+      if(btn){ btn.disabled=true; btn.innerHTML='<i class="ri-check-line" style="font-size:32px"></i><span>Clocked Out</span>'; }
+      if(inBtn) inBtn.disabled=true;
+    }
+    if(typeof updateEmpStats==='function'){ try{updateEmpStats(session.employeeId)}catch(e){} }
+
+    // Get geo (best-effort)
+    let geoStr='';
+    try{
+      const pos = await new Promise((res,rej)=>navigator.geolocation.getCurrentPosition(res,rej,{timeout:5000,maximumAge:60000}));
+      geoStr = pos.coords.latitude.toFixed(6)+','+pos.coords.longitude.toFixed(6);
+    }catch(e){}
+
+    const payload = (type==='in') ? {
+      action:'markAttendanceBiometric', type:'clockIn',
+      licenseKey:STATE.licenseKey, employeeId:session.employeeId,
+      employeeName: emp.name || session.employeeName || session.username,
+      department: emp.department || '',
+      date:dateStr, checkIn:pktFmt, status:'Present',
+      authMethod:'Fingerprint', geoLocation:geoStr, timezone:'Asia/Karachi'
+    } : {
+      action:'markAttendanceBiometric', type:'clockOut',
+      licenseKey:STATE.licenseKey, employeeId:session.employeeId, date:dateStr,
+      checkOut:pktFmt, authMethod:'Fingerprint', geoLocation:geoStr, totalHours:'', timezone:'Asia/Karachi'
+    };
+
+    if(!navigator.onLine){
+      enqueue({ payload });
+      showToast((type==='in'?'Clock-in':'Clock-out')+' queued — will sync when online');
+      return;
+    }
+    try{
+      const d = await apiPost(payload);
+      if(!d || !d.success){
+        // Network/API failed — queue for retry
+        enqueue({ payload });
+        showToast('Saved locally — will retry');
+      } else {
+        if(typeof loadAttendance==='function') try{loadAttendance()}catch(e){}
+      }
+    }catch(e){
+      enqueue({ payload });
+      showToast('Saved locally — will retry');
+    }
+  };
+
+  /* ── (g) Improved biometric retry UI ── */
+  function patchBioRetry(){
+    const overlay = document.getElementById('bioScanOverlay');
+    if(!overlay || overlay.dataset.retryPatched) return;
+    overlay.dataset.retryPatched='1';
+    // Add retry button
+    const cancel = document.getElementById('bioCancelBtn');
+    if(cancel && !document.getElementById('bioRetryBtn')){
+      const retry = document.createElement('button');
+      retry.id='bioRetryBtn'; retry.className='bio-cancel-btn';
+      retry.style.cssText='margin-right:10px;background:rgba(var(--accent),.18);color:rgb(var(--accent));display:none';
+      retry.innerHTML='<i class="ri-refresh-line"></i> Try Again';
+      retry.onclick = function(){
+        const t = overlay.dataset.lastType || 'in';
+        overlay.classList.remove('active');
+        retry.style.display='none';
+        setTimeout(()=>{ if(typeof verifyBiometric==='function') verifyBiometric(t); }, 200);
+      };
+      cancel.parentNode.insertBefore(retry, cancel);
+    }
+  }
+  patchBioRetry();
+  // Wrap verifyBiometric to remember type and surface retry on failure
+  const _origVerifyBio = window.verifyBiometric;
+  if(typeof _origVerifyBio === 'function'){
+    window.verifyBiometric = async function(type){
+      patchBioRetry();
+      const overlay = document.getElementById('bioScanOverlay');
+      if(overlay) overlay.dataset.lastType = type;
+      const retryBtn = document.getElementById('bioRetryBtn');
+      if(retryBtn) retryBtn.style.display='none';
+      try{ await _origVerifyBio.apply(this, arguments); }
+      finally{
+        // If overlay is still active and we have failed attempts, expose retry
+        setTimeout(()=>{
+          if(overlay && overlay.classList.contains('active') && (window.bioFailedAttempts||0) > 0 && !window.bioLocked){
+            if(retryBtn) retryBtn.style.display='inline-flex';
+          }
+        }, 300);
+      }
+    };
+  }
+
+  /* ── (i) Settings tab for employee w/ Register Fingerprint ── */
+  function injectEmployeeSettings(){
+    if(window.DASH && DASH.role !== 'employee') return;
+    const content = document.getElementById('dashContent');
+    if(!content) return;
+    if(document.getElementById('page-settings-emp')) return;
+
+    // Add nav item if not present
+    const has = document.querySelector('[data-tab="settings"]');
+    if(!has){
+      const navHtml = `<div class="dash-nav-item" data-tab="settings" onclick="switchTab('settings')"><i class="ri-settings-3-line"></i><span>Settings</span></div>`;
+      const sb = document.getElementById('sidebarNav');
+      const tb = document.getElementById('topbarNav');
+      if(sb) sb.insertAdjacentHTML('beforeend', navHtml);
+      if(tb) tb.insertAdjacentHTML('beforeend', navHtml);
+    }
+
+    const page = document.createElement('div');
+    page.className='dash-page'; page.id='page-settings-emp';
+    page.dataset.empSettings='1';
+    // Use same id "page-settings" so switchTab works — but admin already may have one for admin role
+    if(!document.getElementById('page-settings')) page.id = 'page-settings';
+    page.innerHTML = `
+      <div class="page-header"><h1 class="page-title">Settings</h1></div>
+      <div class="bio-settings-card">
+        <div class="bio-settings-icon"><i class="ri-fingerprint-line"></i></div>
+        <div class="bio-settings-info">
+          <div class="bio-settings-title">Biometric Fingerprint</div>
+          <div class="bio-settings-desc">Register your fingerprint on this device for fast, secure clock-in/out.</div>
+          <div id="empBioStatus" class="bio-settings-status unregistered">Not registered</div>
+        </div>
+        <button class="btn btn-primary" id="empBioRegBtn" onclick="empSettingsRegisterBio()"><i class="ri-fingerprint-line"></i> Register Fingerprint</button>
+      </div>
+    `;
+    content.appendChild(page);
+    refreshBioSettingsStatus();
+  }
+  function refreshBioSettingsStatus(){
+    const status = document.getElementById('empBioStatus');
+    const btn = document.getElementById('empBioRegBtn');
+    if(!status || !btn) return;
+    if(window.empCredentialId){
+      status.textContent = '✓ Registered on this device';
+      status.className = 'bio-settings-status registered';
+      btn.disabled = true; btn.style.opacity='.5'; btn.style.cursor='not-allowed';
+      btn.innerHTML = '<i class="ri-check-line"></i> Already Registered';
+    } else {
+      status.textContent = 'Not registered';
+      status.className = 'bio-settings-status unregistered';
+      btn.disabled = false; btn.style.opacity=''; btn.style.cursor='';
+      btn.innerHTML = '<i class="ri-fingerprint-line"></i> Register Fingerprint';
+    }
+  }
+  window.empSettingsRegisterBio = function(){
+    if(typeof showBiometricRegistration === 'function'){
+      showBiometricRegistration(null);
+    }
+  };
+  // Re-render employee settings after dashboard build
+  const _origBuild = window.buildDashboardPages;
+  if(typeof _origBuild === 'function'){
+    window.buildDashboardPages = function(){
+      _origBuild.apply(this, arguments);
+      setTimeout(injectEmployeeSettings, 60);
+      setTimeout(buildBottomNav, 80);
+    };
+  }
+  // Refresh bio status periodically + when overlay closes
+  setInterval(refreshBioSettingsStatus, 2000);
+
+  /* ── (d) Bottom navigation bar (employee, mobile-feel always) ── */
+  function buildBottomNav(){
+    if(!window.DASH || DASH.role !== 'employee') {
+      document.body.classList.remove('bn-on');
+      const old = document.getElementById('nxBottomNav'); if(old) old.remove();
+      return;
+    }
+    let bn = document.getElementById('nxBottomNav');
+    if(!bn){
+      bn = document.createElement('nav');
+      bn.id='nxBottomNav'; bn.className='bottom-nav';
+      document.body.appendChild(bn);
+    }
+    const items = [
+      {id:'attendance', label:'Attendance', icon:'ri-calendar-check-line'},
+      {id:'requests',   label:'Requests',   icon:'ri-file-list-3-line'},
+      {id:'settings',   label:'Settings',   icon:'ri-settings-3-line'},
+      {id:'__logout',   label:'Logout',     icon:'ri-logout-box-r-line'}
+    ];
+    const cur = (window.DASH && DASH.currentTab) || 'attendance';
+    bn.innerHTML = items.map(i=>`
+      <button class="bottom-nav-item${i.id===cur?' active':''}" data-bnitem="${i.id}">
+        <i class="${i.icon}"></i><span>${i.label}</span>
+      </button>`).join('');
+    bn.querySelectorAll('.bottom-nav-item').forEach(b=>{
+      b.onclick = function(){
+        const id = b.dataset.bnitem;
+        if(id==='__logout'){ if(typeof doLogout==='function') doLogout(); return; }
+        if(typeof switchTab==='function') switchTab(id);
+        bn.querySelectorAll('.bottom-nav-item').forEach(x=>x.classList.remove('active'));
+        b.classList.add('active');
+      };
+    });
+    document.body.classList.add('bn-on','has-bottom-nav');
+  }
+  // Hook switchTab to keep bottom nav active state in sync
+  const _switchTab2 = window.switchTab;
+  if(typeof _switchTab2 === 'function'){
+    window.switchTab = function(id){
+      _switchTab2.apply(this, arguments);
+      const bn = document.getElementById('nxBottomNav');
+      if(bn){
+        bn.querySelectorAll('.bottom-nav-item').forEach(b=>{
+          b.classList.toggle('active', b.dataset.bnitem === id);
+        });
+      }
+    };
+  }
+  setInterval(buildBottomNav, 1500);
+
+  /* ── (d) Apply layout-class on body so we can hide hamburger when topbar ── */
+  function applyLayoutClass(){
+    document.body.classList.toggle('layout-topbar', (window.STATE && STATE.layout==='topbar'));
+    document.body.classList.toggle('layout-sidebar', !(window.STATE && STATE.layout==='topbar'));
+  }
+  const _origInit = window.initDashboard;
+  if(typeof _origInit === 'function'){
+    window.initDashboard = function(){
+      _origInit.apply(this, arguments);
+      applyLayoutClass();
+      setTimeout(injectEmployeeSettings, 100);
+      setTimeout(buildBottomNav, 120);
+    };
+  }
+  applyLayoutClass();
+  setInterval(applyLayoutClass, 2000);
+
+})();
 </script>
 
 <!-- Clear Session Button -->
