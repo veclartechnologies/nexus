@@ -2101,13 +2101,32 @@ function setEmpAttRange(range){
   renderEmpAttCarousel();
 }
 function isWeekendDate(d){const w=d.getDay();return w===0||w===6}
+function fmtAttTime(t){
+  if(t===null||t===undefined||t==='') return '—';
+  const s=String(t);
+  if(/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) return s;
+  const d=new Date(s);
+  if(!isNaN(d.getTime())) return d.toTimeString().split(' ')[0];
+  return s;
+}
+function switchAttLoop(sel){
+  const card=sel.closest('.carousel3d-card');if(!card)return;
+  const idx=sel.value;
+  card.querySelectorAll('[data-loop]').forEach(el=>{
+    el.style.display=(el.getAttribute('data-loop')===idx)?'':'none';
+  });
+}
+window.switchAttLoop=switchAttLoop;
 function renderEmpAttCarousel(){
   const el=nexus$('empAttCarousel');if(!el)return;
   const session=(typeof getSession==='function')?getSession():null;
   const myId=session&&session.employeeId?String(session.employeeId):'';
   const myRecs={};
   attendanceRecords.forEach(r=>{
-    if(String(r.employeeId)===myId) myRecs[r.date]=r;
+    if(String(r.employeeId)===myId){
+      if(!myRecs[r.date]) myRecs[r.date]=[];
+      myRecs[r.date].push(r);
+    }
   });
   const today=new Date();today.setHours(0,0,0,0);
   let days=[];
@@ -2118,7 +2137,7 @@ function renderEmpAttCarousel(){
   }
   el.innerHTML=days.map(d=>{
     const iso=d.toISOString().split('T')[0];
-    const rec=myRecs[iso];
+    const recs=myRecs[iso];
     const dayName=d.toLocaleDateString('en-US',{weekday:'short'});
     const dateLabel=d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
     const isFuture=d>today;
@@ -2127,14 +2146,18 @@ function renderEmpAttCarousel(){
     if(weekend){
       badgeHtml='<span class="c3d-badge" style="background:rgba(99,102,241,.15);color:#a5b4fc">Weekend</span>';
       body='<div class="c3d-desc" style="text-align:center;padding-top:14px">Enjoy your day off</div>';
-    } else if(rec){
-      const cls=rec.status==='Present'?'badge-active':rec.status==='Late'?'badge-pending':'badge-rejected';
-      badgeHtml=`<span class="c3d-badge status-badge ${cls}">${rec.status||'—'}</span>`;
-      body=`
-        <div class="c3d-row"><span class="c3d-label">Check In</span><span class="c3d-val">${rec.checkIn||'—'}</span></div>
-        <div class="c3d-row"><span class="c3d-label">Check Out</span><span class="c3d-val">${rec.checkOut||'—'}</span></div>
-        <div class="c3d-row"><span class="c3d-label">Hours</span><span class="c3d-val">${rec.totalHours||'0'}</span></div>
-        ${rec.deduction?`<div class="c3d-row"><span class="c3d-label">Deduction</span><span class="c3d-val" style="color:rgb(var(--danger))">PKR ${rec.deduction}</span></div>`:''}`;
+    } else if(recs&&recs.length){
+      const first=recs[0];
+      const cls=first.status==='Present'?'badge-active':first.status==='Late'?'badge-pending':'badge-rejected';
+      badgeHtml=`<span class="c3d-badge status-badge ${cls}">${first.status||'—'}</span>`;
+      const loopSelect=recs.length>1?`<div style="margin-bottom:8px"><select class="input-field filter-select" style="width:100%;font-size:.78rem;padding:4px 8px" onchange="switchAttLoop(this)">${recs.map((_,i)=>`<option value="${i}">Loop ${i+1}</option>`).join('')}</select></div>`:'';
+      const loopBodies=recs.map((rec,i)=>`
+        <div data-loop="${i}" style="${i===0?'':'display:none'}">
+          <div class="c3d-row"><span class="c3d-label">Check In</span><span class="c3d-val">${fmtAttTime(rec.checkIn)}</span></div>
+          <div class="c3d-row"><span class="c3d-label">Check Out</span><span class="c3d-val">${fmtAttTime(rec.checkOut)}</span></div>
+          ${rec.deduction?`<div class="c3d-row"><span class="c3d-label">Deduction</span><span class="c3d-val" style="color:rgb(var(--danger))">PKR ${rec.deduction}</span></div>`:''}
+        </div>`).join('');
+      body=loopSelect+loopBodies;
     } else if(isFuture){
       badgeHtml='<span class="c3d-badge" style="background:rgba(var(--border),.4);color:rgb(var(--text-muted))">Upcoming</span>';
       body='<div class="c3d-desc" style="text-align:center;padding-top:14px">Scheduled work day</div>';
@@ -2952,9 +2975,9 @@ async function submitReject(id){
 
 function showSubmitRequestModal(){
   showModal('Submit Request',`
-    <label>Request Type</label><select class="input-field filter-select" id="srType" style="width:100%;margin-bottom:14px"><option>Leave</option><option>Early Departure</option><option>Work From Home</option><option>Other</option></select>
+    <label>Request Type</label><select class="input-field filter-select" id="srType" style="width:100%;margin-bottom:14px"><option>Casual Leave</option><option>Sick Leave</option><option>Early Departure</option><option>Half Day</option><option>Advance Salary</option><option>Salary Slip</option><option>Bank Opening Letter</option><option>Experience Letter</option><option>Other</option></select>
     <label>Details</label><textarea class="input-field" id="srDetails" rows="3" placeholder="Describe your request..." style="text-align:left;letter-spacing:0;font-weight:400;font-size:.9rem"></textarea>
-    <label>Date</label><input type="date" class="input-field" id="srDate" value="${new Date().toISOString().split('T')[0]}">
+    <label>Date</label><input type="date" data-simple class="input-field" id="srDate" value="${new Date().toISOString().split('T')[0]}">
     <div id="srMsg" class="license-msg"></div>
   `,`<button class="btn btn-secondary" onclick="closeGenericModal()">Cancel</button><button class="btn btn-primary" id="srBtn" onclick="submitRequest()"><i class="ri-check-line"></i> Submit</button>`);
 }
@@ -3485,7 +3508,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   
   // Attach to all date/time inputs
   document.addEventListener('click', function(e) {
-    const input = e.target.closest('input[type="date"], input[type="time"]');
+    const input = e.target.closest('input[type="date"]:not([data-simple]), input[type="time"]:not([data-simple])');
     if(input && !activeScrollPicker) {
       e.preventDefault();
       createScrollPicker(input);
