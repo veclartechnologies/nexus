@@ -2056,7 +2056,7 @@ function showAuditTrailModal(empId,empName){
 
 /* ── Employee: Live Clock + WebAuthn Biometric ── */
 let bioFailedAttempts = 0;
-const BIO_MAX_ATTEMPTS = 3;
+const BIO_MAX_ATTEMPTS = 99;
 let bioLocked = false;
 let bioCancelled = false;
 let empCredentialId = null; // cached from backend
