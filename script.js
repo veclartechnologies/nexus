@@ -1297,14 +1297,14 @@ RENDERERS['admin-requests'] = async function(){
 
 /* ---- Requests: shared category grid + modal ---- */
 window.REQ_TYPE_IMG = {
-  'Casual Leave':'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=600&q=60',
-  'Sick Leave':'https://images.unsplash.com/photo-1580281658626-ee379f3cce93?auto=format&fit=crop&w=600&q=60',
-  'Late Coming':'https://images.unsplash.com/photo-1501139083538-0139583c060f?auto=format&fit=crop&w=600&q=60',
-  'Half Day':'https://images.unsplash.com/photo-1506784983877-45594efa4cbe?auto=format&fit=crop&w=600&q=60',
-  'Advance Salary':'https://images.unsplash.com/photo-1554224155-6726b3ff858f?auto=format&fit=crop&w=600&q=60',
+  'Casual Leave':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/Casual%20Leave.png',
+  'Sick Leave':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/Sick%20Leave.png',
+  'Late Coming':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/lateness.png',
+  'Half Day':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/Half%20Day.png',
+  'Advance Salary':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/Advance%20Salary.png',
   'Waiver Appeal':'https://images.unsplash.com/photo-1450101499163-c8848c66ca85?auto=format&fit=crop&w=600&q=60',
-  'Salary Slip':'https://images.unsplash.com/photo-1554224154-22dec7ec8818?auto=format&fit=crop&w=600&q=60',
-  'Experience Letter':'https://images.unsplash.com/photo-1517842645767-c639042777db?auto=format&fit=crop&w=600&q=60',
+  'Salary Slip':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/Salary%20Slip.png',
+  'Experience Letter':'https://raw.githubusercontent.com/veclartechnologies/nexus/refs/heads/main/Experience%20Letter.png',
   'Bank Opening Letter':'https://images.unsplash.com/photo-1520607162513-77705c0f0d4a?auto=format&fit=crop&w=600&q=60',
   'Custom Requests':'https://images.unsplash.com/photo-1553877522-43269d4ea984?auto=format&fit=crop&w=600&q=60',
   _default:'https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?auto=format&fit=crop&w=600&q=60'
