@@ -1,0 +1,4063 @@
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyL6xeiWSnaOtdkOrdQW4TLxIuQQG9DQ_k-jc8XwTokcIu1ksgfldmNFOQuUBmCTQN9/exec";
+
+const VECLAR = {
+  ENDPOINT: APPS_SCRIPT_URL.indexOf('REPLACE_ME') === -1 ? APPS_SCRIPT_URL : '',
+  COMPANY: 'Veclar Technologies',
+  TZ: 'Asia/Karachi',
+  DEPARTMENTS: ['Sales','Customer Support','Graphics','Leads','Developer','HR'],
+  REQUEST_TYPES: ['Casual Leave','Sick Leave','Late Coming','Half Day','Advance Salary','Waiver Appeal','Salary Slip','Experience Letter','Bank Opening Letter','Custom Requests'],
+  SHIFT: { start:'18:00', end:'03:00' }, // 06:00 PM – 03:00 AM (next day)
+  PRESENT_UNTIL: '18:15',  // ≤ 18:15 = Present
+  LATE_UNTIL:    '18:30',  // 18:16–18:30 = Late
+  // > 18:30 = Half Day (50% deduction)
+  MONTHLY_LEAVE_QUOTA: 2,  // approved leaves per month
+  WORKING_DAYS:  [1,2,3,4,5], // Mon–Fri (0=Sun)
+  CYCLE_START_DAY: 26, PAYDAY: 5,
+  MIN_BASIC_SALARY: 80000,
+  SALES_BASE_LOW: 80000,
+  SALES_BASE_HIGH: 150000,
+  SALES_REV_BUMP: 3001,        // ≥ $3,001 → base 150k
+  SALES_COMM_T1_FROM: 3500,    // 15% on $3,500–$4,999
+  SALES_COMM_T2_FROM: 5000,    // 20% on portion ≥ $5,000
+  USD_TO_PKR: 280,             // editable in Settings
+  HOLIDAYS: []
+};
+// In-memory store for payroll-time inputs (per emp, current cycle)
+let PAYROLL_INPUTS = {}; // { empId: { revenueUSD, weeklyCommPKR, waivedDates, savedAt } }
+try{ PAYROLL_INPUTS = JSON.parse(localStorage.getItem('veclar.payrollInputs')||'{}') || {}; }catch(e){ PAYROLL_INPUTS = {}; }
+function piSave(){ try{ localStorage.setItem('veclar.payrollInputs', JSON.stringify(PAYROLL_INPUTS)); }catch(e){} }
+function piFor(empId){ return PAYROLL_INPUTS[empId] || (PAYROLL_INPUTS[empId] = {revenueUSD:0, weeklyCommPKR:0, waivedDates:[], savedAt:null}); }
+function piCycleKey(){
+  const now = new Date();
+  const cs = new Date(now.getFullYear(), now.getMonth() + (now.getDate()<VECLAR.CYCLE_START_DAY?-1:0), VECLAR.CYCLE_START_DAY);
+  return `${cs.getFullYear()}-${pad(cs.getMonth()+1)}`;
+}
+
+// Persistent Paid/Unpaid status per employee per cycle
+let PAY_STATUS_STORE = {};
+try{ PAY_STATUS_STORE = JSON.parse(localStorage.getItem('veclar.payStatus')||'{}') || {}; }catch(e){ PAY_STATUS_STORE = {}; }
+function _psKey(empId){ return `${empId}::${piCycleKey()}`; }
+window.payStatusGet = function(empId){
+  if (!empId) return null;
+  return PAY_STATUS_STORE[_psKey(empId)] || null;
+};
+window.payStatusSet = function(empId, status, paidAtISO){
+  if (!empId) return;
+  let paidAt = null;
+  if (status==='PAID') paidAt = paidAtISO || new Date().toISOString();
+  PAY_STATUS_STORE[_psKey(empId)] = { status, paidAt };
+  try{ localStorage.setItem('veclar.payStatus', JSON.stringify(PAY_STATUS_STORE)); }catch(e){}
+};
+// Per-employee, per-cycle card LOCK store
+let PAY_LOCK_STORE = {};
+try{ PAY_LOCK_STORE = JSON.parse(localStorage.getItem('veclar.payLocks')||'{}') || {}; }catch(e){ PAY_LOCK_STORE = {}; }
+window.payLockGet = function(empId){ return !!PAY_LOCK_STORE[_psKey(empId)]; };
+window.payLockSet = function(empId, locked){
+  PAY_LOCK_STORE[_psKey(empId)] = !!locked;
+  try{ localStorage.setItem('veclar.payLocks', JSON.stringify(PAY_LOCK_STORE)); }catch(e){}
+};
+try{ const r = Number(localStorage.getItem('veclar.usdRate')); if (r>0) VECLAR.USD_TO_PKR = r; }catch(e){}
+
+/* ---------- helpers ---------- */
+const $  = id => document.getElementById(id);
+const el = (tag, attrs={}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs||{})) {
+    if (k==='class') e.className = v;
+    else if (k==='html') e.innerHTML = v;
+    else if (k.startsWith('on') && typeof v==='function') e.addEventListener(k.slice(2),v);
+    else if (v!=null) e.setAttribute(k,v);
+  }
+  for (const k of kids.flat()) if (k!=null) e.append(k.nodeType?k:document.createTextNode(k));
+  return e;
+};
+const pad = n => String(n).padStart(2,'0');
+const fmtTime = t => {
+  if (!t) return '—';
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return String(t);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+};
+const fmtDate = t => {
+  if (!t) return '—';
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return String(t);
+  return d.toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'numeric'});
+};
+const fmtMoney = n => 'Rs ' + Number(n||0).toLocaleString('en-PK');
+const fmtUSD = n => '$' + Number(n||0).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:2});
+const todayKey = (d=new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const minOf = (hh,mm)=>hh*60+mm;
+const parseHM = s => { const [h,m]=String(s).split(':').map(Number); return minOf(h,m); };
+
+function toast(msg, kind=''){
+  const t = el('div',{class:'toast '+kind}, msg);
+  $('toast').appendChild(t);
+  setTimeout(()=>t.style.opacity='0', 3500);
+  setTimeout(()=>t.remove(), 4000);
+}
+function modal(content, title){
+  const box = $('modalBox');
+  box.innerHTML='';
+  box.append(el('button',{class:'close', onclick:()=>$('modal').classList.remove('show'), 'aria-label':'Close'},'×'));
+  if (title) box.append(el('h2',{}, title));
+  if (typeof content==='string') box.insertAdjacentHTML('beforeend',content);
+  else box.append(content);
+  $('modal').classList.add('show');
+}
+function closeModal(){ $('modal').classList.remove('show'); }
+
+async function withSpinner(btn, fn){
+  if (!btn) return fn();
+  const old = btn.innerHTML, dis = btn.disabled;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="btn-spinner"></span> Working…';
+  try { return await fn(); }
+  finally { btn.innerHTML = old; btn.disabled = dis; }
+}
+
+/* ---------- API layer (user-first / optimistic)
+ *
+ * Strategy:
+ *   1) Run demoApi() synchronously against the in-memory store and return
+ *      its result IMMEDIATELY so the UI updates without latency.
+ *   2) In parallel, POST the same action to the Apps Script Web App.
+ *   3) For READS (list*, get*, computePayroll, verifyLogin):
+ *        - if a server response arrives, hydrate the local store from it
+ *          and emit `data:refresh` so views can re-render silently.
+ *   4) For WRITES: server runs in the background; failures are queued for
+ *      retry in localStorage and a soft toast tells the user.
+ * verifyLogin is awaited (so wrong creds fail loudly), everything else is
+ * fire-and-forget from the UI perspective.
+ * ---------- */
+const SYNC_QUEUE_KEY = 'veclar.sync.queue.v1';
+function _syncQueueLoad(){ try{ return JSON.parse(localStorage.getItem(SYNC_QUEUE_KEY)||'[]'); }catch(e){ return []; } }
+function _syncQueueSave(arr){ try{ localStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(arr.slice(-200))); }catch(e){} }
+function _syncQueuePush(action, params){
+  const q = _syncQueueLoad();
+  q.push({action, params, ts:Date.now()});
+  _syncQueueSave(q);
+}
+async function _serverCall(action, params){
+  if (!VECLAR.ENDPOINT) throw new Error('no-endpoint');
+  const body = new URLSearchParams();
+  body.set('action', action);
+  for (const [k,v] of Object.entries(params||{})){
+    body.set(k, typeof v==='object' ? JSON.stringify(v) : String(v));
+  }
+  const r = await fetch(VECLAR.ENDPOINT, {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
+    body: body.toString()
+  });
+  if (!r.ok) throw new Error('http '+r.status);
+  return await r.json();
+}
+async function _drainSyncQueue(){
+  if (!VECLAR.ENDPOINT) return;
+  const q = _syncQueueLoad(); if (!q.length) return;
+  const remaining = [];
+  for (const item of q){
+    try{ await _serverCall(item.action, item.params); }
+    catch(e){ remaining.push(item); }
+  }
+  _syncQueueSave(remaining);
+  if (remaining.length < q.length && window.VECLAR_BUS) window.VECLAR_BUS.emit('data:refresh');
+}
+setInterval(_drainSyncQueue, 15000);
+window.addEventListener('online', _drainSyncQueue);
+
+// Hydrate DEMO from server payload for read actions
+function _mergePreserveLocal(localArr, remoteArr, key){
+  // Remote is authoritative for items it knows about, but any local-only
+  // items (e.g. an optimistic insert that hasn't reached the server yet)
+  // must be preserved so background hydrate never wipes pending writes.
+  const remoteIds = new Set(remoteArr.map(r => r && r[key]).filter(v => v != null));
+  const localOnly = (localArr||[]).filter(l => l && l[key] != null && !remoteIds.has(l[key]));
+  return remoteArr.concat(localOnly);
+}
+function _hydrateFromServer(action, data){
+  if (!data) return;
+  try{
+    if (action==='listEmployees' && Array.isArray(data)){
+      DEMO.employees = _mergePreserveLocal(DEMO.employees, data, 'empId');
+    } else if (action==='listAttendance' && Array.isArray(data)){
+      DEMO.attendance = _mergePreserveLocal(DEMO.attendance, data, 'id');
+    } else if (action==='listRequests' && Array.isArray(data)){
+      DEMO.requests = _mergePreserveLocal(DEMO.requests, data, 'id');
+    }
+    if (window.VECLAR_BUS) window.VECLAR_BUS.emit('data:refresh');
+  }catch(e){ /* swallow */ }
+}
+
+const READ_ACTIONS = new Set(['listEmployees','listAttendance','listRequests','getEmployeeBundle','computePayroll','verifyLogin']);
+
+async function api(action, params={}){
+  // Optimistic local result first — this is what the caller sees.
+  const local = await demoApi(action, params);
+
+  if (!VECLAR.ENDPOINT){
+    return local;
+  }
+
+  if (action === 'verifyLogin'){
+    // Awaited: security boundary.
+    try{
+      const remote = await _serverCall(action, params);
+      return remote && typeof remote.ok === 'boolean' ? remote : local;
+    }catch(e){
+      console.warn('verifyLogin server failed, using local:', e);
+      return local;
+    }
+  }
+
+  // Fire server call in the background.
+  (async () => {
+    try{
+      const remote = await _serverCall(action, params);
+      if (remote && remote.ok && READ_ACTIONS.has(action)){
+        _hydrateFromServer(action, remote.data);
+      }
+    }catch(e){
+      if (!READ_ACTIONS.has(action)){
+        _syncQueuePush(action, params);
+        try{ toast && toast('Saved locally — will sync when online','warn'); }catch(_){}
+      }
+    }
+  })();
+
+  return local;
+}
+
+/* ---------- DEMO data ---------- */
+const DEMO = (() => {
+  // Bootstrap admin only — no demo employees/attendance/requests.
+  // Admin must add everything from scratch via the UI.
+  const employees = [
+    {empId:'V001', name:'Veclar Admin', pseudoName:'', email:'admin@veclartechnologies.com', username:'admin', password:'veclar2026', dept:'HR', title:'HR Manager', role:'admin', joinDate:'2024-01-15', basicSalary:120000, phone:'+92 332 5755577', cnic:'', gender:'F', dob:'', address:'', emergency:'', bank:'', iban:'', status:'Active'}
+  ];
+  return { employees, attendance:[], requests:[], notices:[], departures:[] };
+})();
+
+function demoApi(action, p){
+  const D = DEMO;
+  const wrap = (ok, data, err) => Promise.resolve({ok, data, error:err});
+  switch(action){
+    case 'verifyLogin': {
+      const u = (p.u||'').toLowerCase();
+      const emp = D.employees.find(e => ((e.username||'').toLowerCase()===u || (e.email||'').toLowerCase()===u) && e.status!=='Old');
+      if (!emp || emp.password !== p.password) return wrap(false, null, 'Invalid credentials');
+      const safe = {...emp}; delete safe.password;
+      return wrap(true, { role: emp.role, employee: safe });
+    }
+    case 'getEmployeeBundle': {
+      const emp = D.employees.find(e=>e.empId===p.empId);
+      if (!emp) return wrap(false, null, 'Not found');
+      const att = D.attendance.filter(a=>a.empId===p.empId).sort((a,b)=>a.date<b.date?1:-1);
+      const reqs = D.requests.filter(r=>r.empId===p.empId).sort((a,b)=>a.createdAt<b.createdAt?1:-1);
+      return wrap(true, {employee:emp, attendance:att, requests:reqs, notices:D.notices.filter(n=>n.empId===p.empId)});
+    }
+    case 'listEmployees': return wrap(true, D.employees);
+    case 'listAttendance': {
+      if (p.date) return wrap(true, D.attendance.filter(a=>a.date===p.date));
+      if (p.from && p.to) return wrap(true, D.attendance.filter(a=>a.date>=p.from && a.date<=p.to));
+      return wrap(true, D.attendance);
+    }
+    case 'importAttendance': {
+      const rows = JSON.parse(p.payload);
+      let ins=0, upd=0;
+      rows.forEach(r=>{
+        const ex = D.attendance.find(a=>a.empId===r.empId && a.date===r.date && a.source==='zk');
+        if (ex){ Object.assign(ex,r); upd++; }
+        else { D.attendance.push({id:'A'+(D.attendance.length+1), source:'zk', ...r}); ins++; }
+      });
+      return wrap(true, {inserted:ins, updated:upd, total:rows.length});
+    }
+    case 'listRequests': return wrap(true, D.requests);
+    case 'submitRequest': {
+      const r = JSON.parse(p.payload);
+      r.id = 'R'+(D.requests.length+1);
+      r.status = 'Pending';
+      r.createdAt = new Date().toISOString();
+      D.requests.unshift(r);
+      return wrap(true, r);
+    }
+    case 'approveRequest':
+    case 'rejectRequest': {
+      const r = D.requests.find(x=>x.id===p.id);
+      if (!r) return wrap(false,null,'Not found');
+      r.status = action==='approveRequest' ? 'Approved' : 'Rejected';
+      r.remarks = p.remarks || '';
+      return wrap(true, r);
+    }
+    case 'quoteRequest': {
+      const r = D.requests.find(x=>x.id===p.id);
+      if (!r) return wrap(false,null,'Not found');
+      r.status = 'Quoted';
+      r.remarks = p.remarks || '';
+      return wrap(true, r);
+    }
+    case 'clockIn':
+    case 'clockOut': {
+      const day = todayKey();
+      let rec = D.attendance.find(a=>a.empId===p.empId && a.date===day);
+      const now = new Date().toISOString();
+      if (action==='clockIn'){
+        if (rec) rec.checkIn = now;
+        else D.attendance.unshift({id:'A'+(D.attendance.length+1), empId:p.empId, date:day, checkIn:now, checkOut:null, source:'manual'});
+      } else {
+        if (rec) rec.checkOut = now;
+        else D.attendance.unshift({id:'A'+(D.attendance.length+1), empId:p.empId, date:day, checkIn:null, checkOut:now, source:'manual'});
+      }
+      return wrap(true, {date:day});
+    }
+    case 'upsertEmployee': {
+      const e = JSON.parse(p.payload);
+      const i = D.employees.findIndex(x=>x.empId===e.empId);
+      if (i>=0) Object.assign(D.employees[i], e); else { e.empId = e.empId || ('V'+pad(D.employees.length+1)); D.employees.push(e); }
+      return wrap(true, e);
+    }
+    case 'departEmployee': {
+      const e = D.employees.find(x=>x.empId===p.empId);
+      if (!e) return wrap(false,null,'Not found');
+      e.status = 'Old';
+      e.departureType = p.type;
+      e.departureDate = p.date;
+      e.departureNote = p.note||'';
+      D.departures.push({empId:e.empId, type:p.type, date:p.date, note:p.note||'', at:new Date().toISOString()});
+      return wrap(true, e);
+    }
+    case 'computePayroll': {
+      const emp = D.employees.find(e=>e.empId===p.empId);
+      if (!emp) return wrap(false,null,'Not found');
+      const pi = piFor(emp.empId);
+      const opts = {
+        revenueUSD: p.revenueUSD!=null ? Number(p.revenueUSD) : pi.revenueUSD,
+        weeklyCommPKR: p.weeklyCommPKR!=null ? Number(p.weeklyCommPKR) : pi.weeklyCommPKR,
+        advanceAmount: p.advanceAmount!=null ? Number(p.advanceAmount) : (pi.advanceAmount||0),
+        otherDeductions: p.otherDeductions!=null ? Number(p.otherDeductions) : (pi.otherDeductions||0),
+        waivedDates: pi.waivedDates || [],
+        cycleKey: p.cycleKey || null
+      };
+      return wrap(true, computePayrollFor(emp, D, opts));
+    }
+    case 'issueNotice': {
+      D.notices.push({id:'N'+(D.notices.length+1), empId:p.empId, reason:p.reason, at:new Date().toISOString()});
+      return wrap(true, true);
+    }
+    default: return wrap(false, null, 'Unknown action: '+action);
+  }
+}
+
+/* ---------- attendance status engine ---------- */
+function attendanceStatus(rec, employee){
+  if (!rec) return {label:'Absent', cls:'bad', code:'A'};
+  if (rec.leaveStatus==='Approved') return {label:'Leave (Paid)', cls:'ok', code:'LP'};
+  if (rec.leaveStatus==='Pending')  return {label:'Leave (Pending)', cls:'warn', code:'LX'};
+  if (rec.leaveStatus==='Rejected') return {label:'Leave (Unpaid)', cls:'bad', code:'LU'};
+  if (!rec.checkIn) return {label:'Absent', cls:'bad', code:'A'};
+  const d = new Date(rec.checkIn);
+  const t = d.getHours()*60+d.getMinutes();
+  const present = parseHM(VECLAR.PRESENT_UNTIL);
+  const late    = parseHM(VECLAR.LATE_UNTIL);
+  if (t <= present) return {label:'Present', cls:'ok', code:'P'};
+  if (t <= late)    return {label:'Late', cls:'warn', code:'L'};
+  return {label:'Half Day', cls:'warn', code:'H'};
+}
+
+function isSales(emp){ return emp && emp.dept==='Sales'; }
+function isSalesLead(emp){ return isSales(emp) && /lead|head|manager/i.test(emp.title||''); }
+
+/* ---------- Payroll engine ---------- */
+function computePayrollFor(emp, D, opts){
+  opts = opts || {};
+  const revenue = Number(opts.revenueUSD!=null ? opts.revenueUSD : (emp.revenueMTD||0));
+  const weeklyCommPKR = Number(opts.weeklyCommPKR||0);
+  const waived = new Set(opts.waivedDates||[]);
+  const usdRate = Number(VECLAR.USD_TO_PKR||0);
+
+  // Build attendance for current cycle (CYCLE_START_DAY → next month CYCLE_START_DAY-1)
+  const now = new Date();
+  let cycleStart;
+  if (opts.cycleKey){
+    const [yy,mm] = opts.cycleKey.split('-').map(Number);
+    cycleStart = new Date(yy, mm-1, VECLAR.CYCLE_START_DAY);
+  } else {
+    cycleStart = new Date(now.getFullYear(), now.getMonth() + (now.getDate()<VECLAR.CYCLE_START_DAY?-1:0), VECLAR.CYCLE_START_DAY);
+  }
+  const cycleEnd = new Date(cycleStart); cycleEnd.setMonth(cycleEnd.getMonth()+1); cycleEnd.setDate(cycleEnd.getDate()-1);
+  const att = D.attendance.filter(a=>a.empId===emp.empId && a.date>=todayKey(cycleStart) && a.date<=todayKey(cycleEnd));
+  const reqs = D.requests.filter(r=>r.empId===emp.empId && (r.type||'').includes('Leave') && r.date>=todayKey(cycleStart) && r.date<=todayKey(cycleEnd));
+
+  let workingDays = 0;
+  for (let d=new Date(cycleStart); d<=cycleEnd; d.setDate(d.getDate()+1))
+    if (VECLAR.WORKING_DAYS.includes(d.getDay())) workingDays++;
+
+  let lates=0, halfDays=0, present=0, paidLeaves=0, unpaidLeaves=0, absents=0;
+  let waivedHalfDays=0, waivedLates=0;
+  const days = {};
+  att.forEach(a=>{ days[a.date]=a; });
+  reqs.forEach(r=>{
+    const day = days[r.date] || (days[r.date]={empId:emp.empId, date:r.date});
+    day.leaveStatus = r.status;
+  });
+  for (let d=new Date(cycleStart); d<=cycleEnd; d.setDate(d.getDate()+1)){
+    if (!VECLAR.WORKING_DAYS.includes(d.getDay())) continue;
+    if (d > now) continue;
+    const k = todayKey(d);
+    const rec = days[k];
+    const st = attendanceStatus(rec, emp);
+    const isWaived = waived.has(k);
+    if (st.code==='P') present++;
+    else if (st.code==='L'){ lates++; present++; if(isWaived) waivedLates++; }
+    else if (st.code==='H'){ halfDays++; present++; if(isWaived) waivedHalfDays++; }
+    else if (st.code==='LP'){ paidLeaves++; }
+    else if (st.code==='LU'||st.code==='LX'){ unpaidLeaves++; }
+    else absents++;
+  }
+
+  // Sales base bump
+  let basic = isSales(emp)
+    ? Math.max(VECLAR.MIN_BASIC_SALARY, emp.basicSalary || VECLAR.MIN_BASIC_SALARY)
+    : Number(emp.basicSalary || 0);
+  let salesCommUSD = 0, basicNote = '';
+  if (isSales(emp) && !isSalesLead(emp)){
+    if (revenue >= VECLAR.SALES_REV_BUMP){
+      basic = Math.max(basic, VECLAR.SALES_BASE_HIGH);
+      basicNote = `Bumped to ${fmtMoney(VECLAR.SALES_BASE_HIGH)} (revenue ≥ $${VECLAR.SALES_REV_BUMP})`;
+    } else {
+      basic = Math.max(basic, VECLAR.SALES_BASE_LOW);
+      basicNote = `Base ${fmtMoney(VECLAR.SALES_BASE_LOW)} (revenue < $${VECLAR.SALES_REV_BUMP})`;
+    }
+    if (revenue >= VECLAR.SALES_COMM_T1_FROM){
+      salesCommUSD += Math.max(0, Math.min(revenue, VECLAR.SALES_COMM_T2_FROM) - VECLAR.SALES_COMM_T1_FROM) * 0.15;
+    }
+    if (revenue >= VECLAR.SALES_COMM_T2_FROM){
+      salesCommUSD += (revenue - VECLAR.SALES_COMM_T2_FROM) * 0.20;
+    }
+  }
+  const salesCommPKR = Math.round(salesCommUSD * usdRate);
+
+  const daily = workingDays>0 ? basic/workingDays : 0;
+  let halfDed = Math.max(0, halfDays - waivedHalfDays) * 0.5 * daily;
+  let absDed  = (absents + unpaidLeaves) * daily;
+  const lateDed = 0;
+
+  let quotaUsed = 0, extraUnpaid = 0;
+  Object.values(days).filter(x=>x.leaveStatus==='Approved').sort((a,b)=>a.date<b.date?-1:1).forEach(x=>{
+    if (quotaUsed < VECLAR.MONTHLY_LEAVE_QUOTA) quotaUsed++; else extraUnpaid++;
+  });
+  let quotaDed = extraUnpaid * daily;
+
+  // Rule: if Sales revenue ≥ $3,500, no attendance-based deductions
+  let attendanceWaivedByRevenue = false;
+  if (isSales(emp) && revenue >= 3500){
+    halfDed = 0; absDed = 0; quotaDed = 0;
+    attendanceWaivedByRevenue = true;
+  }
+
+  const advanceAmount = Number(opts.advanceAmount||0);
+  const otherDeductions = Number(opts.otherDeductions||0);
+
+  const net = basic - lateDed - halfDed - absDed - quotaDed + salesCommPKR + weeklyCommPKR - advanceAmount - otherDeductions;
+  return {
+    empId:emp.empId, basic, basicNote, daily:Math.round(daily), workingDays,
+    present, lates, halfDays, paidLeaves, unpaidLeaves, absents,
+    waivedHalfDays, waivedLates,
+    halfDed:Math.round(halfDed), absDed:Math.round(absDed), quotaDed:Math.round(quotaDed),
+    revenue, salesCommUSD: Math.round(salesCommUSD*100)/100, salesCommPKR,
+    weeklyCommPKR: Math.round(weeklyCommPKR), usdRate,
+    extraUnpaid, leaveQuota: VECLAR.MONTHLY_LEAVE_QUOTA, quotaUsed,
+    cycleStart: todayKey(cycleStart), cycleEnd: todayKey(cycleEnd),
+    advanceAmount: Math.round(advanceAmount), otherDeductions: Math.round(otherDeductions),
+    attendanceWaivedByRevenue,
+    net: Math.round(net)
+  };
+}
+
+/* ---------- session ---------- */
+const SESSION = {
+  get(){ try{ return JSON.parse(sessionStorage.getItem('veclar.session')||'null'); }catch(e){ return null; } },
+  set(s){ sessionStorage.setItem('veclar.session', JSON.stringify(s)); },
+  clear(){ sessionStorage.removeItem('veclar.session'); }
+};
+
+/* ---------- nav config ---------- */
+const NAV = {
+  employee: [
+    {id:'attendance', label:'Attend', icon:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'},
+    {id:'home', label:'Home', icon:'<rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/>'},
+    {id:'requests', label:'Requests', icon:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>'},
+    {id:'payroll', label:'Payroll', icon:'<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M2 10h20M2 14h20"/>'},
+    {id:'profile', label:'Profile', icon:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'}
+  ],
+  admin: [
+    {id:'dashboard', label:'Dash', icon:'<rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/>'},
+    {id:'people', label:'People', icon:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0"/><circle cx="17" cy="9" r="3"/><path d="M22 21a5 5 0 0 0-8-4"/>'},
+    {id:'admin-attendance', label:'Attend', icon:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'},
+    {id:'admin-requests', label:'Requests', icon:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>'},
+    {id:'admin-payroll', label:'Payroll', icon:'<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M2 10h20M2 14h20"/>'},
+    
+    {id:'reports', label:'Reports', icon:'<path d="M3 3v18h18"/><path d="M7 14l3-3 4 4 5-6"/>'},
+    {id:'settings', label:'Set', icon:'<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 1 1-14 0 7 7 0 0 1 14 0z"/>'}
+  ]
+};
+
+function buildNav(role){
+  const nav = $('bottomnav');
+  nav.innerHTML = '';
+  const items = NAV[role] || NAV.employee;
+  items.forEach((it, i) => {
+    const b = el('button', {class:'navbtn'+(i===0?' active':''), 'data-tab':it.id,
+      onclick:()=>switchView(it.id)});
+    b.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${it.icon}</svg>${it.label}`;
+    nav.appendChild(b);
+  });
+  $('panelName').textContent = role==='admin' ? 'Admin Control' : 'Employee Portal';
+}
+
+function switchView(id){
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active', b.dataset.tab===id));
+  const v = $('view-'+id);
+  if (v){ v.classList.add('active'); }
+  RENDERERS[id] && RENDERERS[id]();
+}
+
+/* =====================================================================
+ * VIEWS
+ * ===================================================================== */
+function carousel(items, renderCard){
+  const wrap = el('div',{class:'carousel'});
+  const nav = el('div',{class:'nav'});
+  const prev = el('button',{title:'Prev'},'‹');
+  const next = el('button',{title:'Next'},'›');
+  const track = el('div',{class:'track'});
+  items.forEach(it=>{ const c = renderCard(it); c.classList.add('card'); track.appendChild(c); });
+  if (!items.length) track.appendChild(el('div',{class:'card'}, el('div',{class:'kv'}, el('span',{class:'k'},'No data yet.'))));
+  prev.addEventListener('click',()=>track.scrollBy({left:-300,behavior:'smooth'}));
+  next.addEventListener('click',()=>track.scrollBy({left:300,behavior:'smooth'}));
+  nav.append(prev,next);
+  wrap.append(nav, track);
+  return wrap;
+}
+
+const RENDERERS = {};
+
+/* ---- Employee: Home ---- */
+RENDERERS.home = async function(){
+  const s = SESSION.get(); if (!s) return;
+  const v = $('view-home'); v.innerHTML='';
+  const emp = s.employee;
+  const hero = el('div',{class:'hero'});
+  hero.innerHTML = `
+    <div>
+      <h1>Good evening, <b>${(emp.name||'').split(' ')[0]}</b></h1>
+      <div class="sub">${emp.title} · ${emp.dept} · Shift ${VECLAR.SHIFT.start} – ${VECLAR.SHIFT.end}</div>
+    </div>
+    <div class="clock"><div class="t" id="hClk">--:--:--</div><div class="d" id="hDate">—</div></div>`;
+  v.appendChild(hero);
+
+  const bundle = await api('getEmployeeBundle', {empId:emp.empId});
+  const att = (bundle.data&&bundle.data.attendance)||[];
+  const reqs = (bundle.data&&bundle.data.requests)||[];
+  const monthAtt = att.filter(a=>a.date.startsWith(todayKey().slice(0,7)));
+  const lates = monthAtt.filter(a=>attendanceStatus(a,emp).code==='L').length;
+  const leavesUsed = reqs.filter(r=>(r.type||'').includes('Leave')&&r.status==='Approved'&&r.date.startsWith(todayKey().slice(0,7))).length;
+
+  const kpis = el('div',{class:'kpis'});
+  [
+    {l:'Present (Mo)', n:monthAtt.length, d:`Shift ${VECLAR.SHIFT.start}`},
+    {l:'Late (Mo)', n:lates, d:lates?'Tracked':'On time', down:lates>0},
+    {l:'Leaves Used', n:`${leavesUsed}/${VECLAR.MONTHLY_LEAVE_QUOTA}`, d:`${Math.max(0,VECLAR.MONTHLY_LEAVE_QUOTA-leavesUsed)} left`},
+    {l:'Pending Reqs', n:reqs.filter(r=>r.status==='Pending').length, d:'Awaiting HR'}
+  ].forEach(k=>{
+    const c = el('div',{class:'kpi'});
+    c.innerHTML = `<div class="lbl"><span class="ic">●</span>${k.l}</div><div class="num">${k.n}</div><div class="delta ${k.down?'down':''}">${k.d}</div>`;
+    kpis.appendChild(c);
+  });
+  v.appendChild(kpis);
+
+  function tk(){
+    const d=new Date();
+    $('hClk') && ($('hClk').textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`);
+    $('hDate') && ($('hDate').textContent = d.toLocaleDateString(undefined,{weekday:'long',day:'2-digit',month:'short'}));
+  }
+  tk(); clearInterval(window.__hTk); window.__hTk=setInterval(tk,1000);
+};
+
+/* ---- Employee: Attendance (default tab) ---- */
+RENDERERS.attendance = async function(){
+  const s = SESSION.get(); if (!s) return;
+  const v = $('view-attendance'); v.innerHTML='';
+  const emp = s.employee;
+  v.innerHTML = `<div class="hero"><div><h1>My <b>Attendance</b></h1>
+    <div class="sub">Shift ${VECLAR.SHIFT.start} – ${VECLAR.SHIFT.end} · Present ≤ ${VECLAR.PRESENT_UNTIL} · Late ≤ ${VECLAR.LATE_UNTIL} · Half Day after</div></div></div>`;
+
+  const big = el('div',{class:'bigact'});
+  big.append(
+    el('button',{onclick:e=>withSpinner(e.currentTarget,()=>doClock('in'))}, 'Clock In'),
+    el('button',{class:'out', onclick:e=>withSpinner(e.currentTarget,()=>doClock('out'))}, 'Clock Out')
+  );
+  v.appendChild(big);
+
+  const bundle = await api('getEmployeeBundle', {empId:emp.empId});
+  const att = (bundle.data&&bundle.data.attendance)||[];
+  const panel = el('div',{class:'panel'});
+  panel.innerHTML = `<h3><span class="accent"></span>Recent Days</h3><div class="scroll-x"><table class="tbl"><thead><tr><th>Date</th><th>Check In</th><th>Check Out</th><th>Status</th></tr></thead><tbody></tbody></table></div>`;
+  const tb = panel.querySelector('tbody');
+  att.slice(0,30).forEach(a=>{
+    const st = attendanceStatus(a, emp);
+    tb.appendChild(el('tr',{},
+      el('td',{}, fmtDate(a.date)),
+      el('td',{}, fmtTime(a.checkIn)),
+      el('td',{}, fmtTime(a.checkOut)),
+      el('td',{html:`<span class="pill ${st.cls==='ok'?'ok':st.cls==='warn'?'warn':'bad'}">${st.label}</span>`})
+    ));
+  });
+  v.appendChild(panel);
+};
+
+async function doClock(kind){
+  const s = SESSION.get(); if (!s) return;
+  const r = await api(kind==='in'?'clockIn':'clockOut', {empId:s.employee.empId});
+  if (r.ok){ toast(kind==='in'?'Clocked in':'Clocked out','ok'); RENDERERS.attendance&&RENDERERS.attendance(); }
+  else toast(r.error||'Failed','bad');
+}
+
+/* ---- Employee: Requests ---- */
+RENDERERS.requests = async function(){
+  const s = SESSION.get(); if (!s) return;
+  const v = $('view-requests'); v.innerHTML='';
+  const emp = s.employee;
+  v.innerHTML = `<div class="hero"><div><h1>My <b>Requests</b></h1><div class="sub">Submit leave, advance, slips and letters</div></div></div>`;
+
+  const form = el('form',{class:'panel', id:'reqForm'});
+  form.innerHTML = `<h3><span class="accent"></span>Submit Request</h3>
+    <div class="form-grid cols-2">
+      <div><label>Request Type</label>
+        <select id="reqType" required>${VECLAR.REQUEST_TYPES.map(t=>`<option value="${t}">${t}</option>`).join('')}</select>
+      </div>
+      <div><label>Date</label><input id="reqDate" type="date" required /></div>
+      <div><label>Priority</label><select id="reqPriority"><option>Normal</option><option>Urgent</option></select></div>
+      <div></div>
+      <div style="grid-column:1/-1"><label>Description</label><textarea id="reqReason" required></textarea></div>
+    </div>
+    <div class="row" style="margin-top:14px"><button type="submit" class="gold-btn" style="max-width:220px">Submit</button></div>`;
+  v.appendChild(form);
+  form.addEventListener('submit', async e=>{
+    e.preventDefault();
+    const btn = form.querySelector('button[type=submit]');
+    await withSpinner(btn, async ()=>{
+      const payload = { empId:emp.empId, type:$('reqType').value, date:$('reqDate').value, priority:$('reqPriority').value, reason:$('reqReason').value.trim() };
+      const r = await api('submitRequest', {payload:JSON.stringify(payload)});
+      if (r.ok){ toast('Request submitted','ok'); form.reset(); renderMyGrid(); }
+      else toast(r.error||'Failed','bad');
+    });
+  });
+
+  const list = el('div',{class:'panel'});
+  list.innerHTML = `<h3><span class="accent"></span>My Request Categories</h3><div id="myReqGrid"></div>`;
+  v.appendChild(list);
+  await renderMyGrid();
+
+  async function renderMyGrid(){
+    const r = await api('getEmployeeBundle',{empId:emp.empId});
+    const reqs = (r.data&&r.data.requests)||[];
+    const host = $('myReqGrid'); host.innerHTML='';
+    host.appendChild(buildRequestTypeGrid(reqs, {admin:false, empId:emp.empId}));
+  }
+};
+
+/* ---- Employee: Payroll ---- */
+RENDERERS.payroll = async function(){
+  const s = SESSION.get(); if (!s) return;
+  const v = $('view-payroll'); v.innerHTML='';
+  const emp = s.employee;
+  const r = await api('computePayroll', {empId:emp.empId});
+  const p = r.data||{};
+  v.innerHTML = `<div class="hero"><div><h1>My <b>Payroll</b></h1>
+    <div class="sub">Cycle ${fmtDate(p.cycleStart)} → ${fmtDate(p.cycleEnd)} · Working Days ${p.workingDays}</div></div></div>`;
+  const sum = el('div',{class:'panel'});
+  sum.innerHTML = `<h3><span class="accent"></span>Estimate</h3>
+    <div class="kv"><span class="k">Basic</span><span class="v">${fmtMoney(p.basic)}</span></div>
+    ${p.basicNote?`<div class="kv"><span class="k">Basic Rule</span><span class="v" style="font-weight:400;color:#bbb">${p.basicNote}</span></div>`:''}
+    <div class="kv"><span class="k">Daily</span><span class="v">${fmtMoney(p.daily)}</span></div>
+    <div class="kv"><span class="k">Present / Late / Half</span><span class="v">${p.present} / ${p.lates} / ${p.halfDays}</span></div>
+    <div class="kv"><span class="k">Paid Leaves</span><span class="v">${p.paidLeaves} / ${p.leaveQuota}</span></div>
+    <div class="kv"><span class="k">Half-day Deduction</span><span class="v">-${fmtMoney(p.halfDed)}</span></div>
+    <div class="kv"><span class="k">Absent Deduction</span><span class="v">-${fmtMoney(p.absDed)}</span></div>
+    <div class="kv"><span class="k">Excess-Leave Deduction</span><span class="v">-${fmtMoney(p.quotaDed)}</span></div>
+    ${isSales(emp)?`<div class="kv"><span class="k">Revenue (MTD)</span><span class="v">${fmtUSD(p.revenue)}</span></div>
+       <div class="kv"><span class="k">Sales Commission</span><span class="v" style="color:var(--ok)">+${fmtUSD(p.salesCommUSD)}</span></div>`:''}
+    <div class="kv" style="border-top:1px solid var(--gold-dim);margin-top:8px;padding-top:12px"><span class="k" style="color:var(--gold);letter-spacing:.18em">NET PAY</span><span class="v" style="font-size:18px;color:var(--gold)">${fmtMoney(p.net)}${isSales(emp)?` + ${fmtUSD(p.salesCommUSD)}`:''}</span></div>`;
+  v.appendChild(sum);
+};
+
+/* ---- Employee: Profile ---- */
+RENDERERS.profile = async function(){
+  const s = SESSION.get(); if (!s) return;
+  const v = $('view-profile'); v.innerHTML='';
+  const emp = s.employee;
+  v.innerHTML = `<div class="hero"><div><h1>My <b>Profile</b></h1><div class="sub">${emp.title} · ${emp.dept}</div></div></div>`;
+  const card = el('div',{class:'panel'});
+  card.innerHTML = `<h3><span class="accent"></span>Personal Information</h3>
+    <div class="kv"><span class="k">Employee ID</span><span class="v">${emp.empId}</span></div>
+    <div class="kv"><span class="k">Name</span><span class="v">${emp.name}</span></div>
+    ${emp.pseudoName?`<div class="kv"><span class="k">Pseudo Name</span><span class="v">${emp.pseudoName}</span></div>`:''}
+    <div class="kv"><span class="k">Contact</span><span class="v">${emp.phone||'—'}</span></div>
+    <div class="kv"><span class="k">Email</span><span class="v">${emp.email}</span></div>
+    <div class="kv"><span class="k">Department</span><span class="v">${emp.dept}</span></div>
+    <div class="kv"><span class="k">Designation</span><span class="v">${emp.title}</span></div>
+    <div class="kv"><span class="k">Join Date</span><span class="v">${fmtDate(emp.joinDate)}</span></div>
+    <div class="kv"><span class="k">Shift</span><span class="v">${VECLAR.SHIFT.start} – ${VECLAR.SHIFT.end} PKT</span></div>`;
+  v.appendChild(card);
+};
+
+/* =====================================================================
+ * ADMIN
+ * ===================================================================== */
+
+/* ---- Admin: Dashboard ---- */
+RENDERERS.dashboard = async function(){
+  const s = SESSION.get(); if (!s) return;
+  const v = $('view-dashboard'); v.innerHTML='';
+  v.innerHTML = `<div class="hero">
+    <div><h1>Welcome back, <b>${s.employee.name.split(' ')[0]}</b></h1><div class="sub">${VECLAR.COMPANY} · Admin Control Panel</div></div>
+    <div class="clock"><div class="t" id="aClk">--:--:--</div><div class="d" id="aDate">—</div></div>
+  </div>`;
+  function tk(){ const d=new Date(); $('aClk')&&($('aClk').textContent=`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`); $('aDate')&&($('aDate').textContent=d.toLocaleDateString(undefined,{weekday:'long',day:'2-digit',month:'short'})); }
+  tk(); clearInterval(window.__aTk); window.__aTk=setInterval(tk,1000);
+
+  const emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old');
+  const reqs = (await api('listRequests',{})).data||[];
+  const att = (await api('listAttendance',{date:todayKey()})).data||[];
+  const lates = att.filter(a=>{ const e=emps.find(x=>x.empId===a.empId); return e&&attendanceStatus(a,e).code==='L'; }).length;
+  const pending = reqs.filter(r=>r.status==='Pending').length;
+
+  const kpis = el('div',{class:'kpis'});
+  [
+    {l:'Active Employees', n:emps.length, d:`${VECLAR.DEPARTMENTS.length} departments`},
+    {l:'Present Today', n:att.length, d:`${Math.round(att.length/Math.max(1,emps.length-1)*100)}%`},
+    {l:'Late Today', n:lates, d:lates?'Tracked':'On time', down:lates>0},
+    {l:'Pending Requests', n:pending, d:'Awaiting review', down:pending>0}
+  ].forEach(k=>{
+    const c=el('div',{class:'kpi'});
+    c.innerHTML=`<div class="lbl"><span class="ic">●</span>${k.l}</div><div class="num">${k.n}</div><div class="delta ${k.down?'down':''}">${k.d}</div>`;
+    kpis.appendChild(c);
+  });
+  v.appendChild(kpis);
+
+  // Department headcount mini-chart
+  const dp = el('div',{class:'panel'});
+  dp.innerHTML = `<h3><span class="accent"></span>Headcount by Department</h3>`;
+  const counts = VECLAR.DEPARTMENTS.map(d=>({d, n:emps.filter(e=>e.dept===d).length}));
+  const max = Math.max(1, ...counts.map(c=>c.n));
+  counts.forEach(c=>{
+    const row = el('div',{class:'bar-row'});
+    row.innerHTML = `<span class="lbl">${c.d}</span><div class="bar"><span style="width:${c.n/max*100}%"></span></div><span class="num">${c.n}</span>`;
+    dp.appendChild(row);
+  });
+  v.appendChild(dp);
+};
+
+/* ---- Admin: People ---- */
+let PEOPLE_VIEW = 'grid'; // grid | cards | table
+// Global photo helper used by both Payroll and People-Directory cards
+window._EMP_PHOTOS = [];
+// Initials-based SVG avatar (admin configures real photos when adding employees).
+window._empInitials = function(name){
+  const parts = String(name||'').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  const a = parts[0][0]||'';
+  const b = parts.length>1 ? parts[parts.length-1][0] : '';
+  return (a+b).toUpperCase();
+};
+window._empPhoto = function(emp, idx){
+  if (emp && emp.photo) return emp.photo;
+  const initials = window._empInitials(emp && (emp.name||emp.empId));
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><defs><linearGradient id='g' x1='0' x2='0' y1='0' y2='1'><stop offset='0' stop-color='%23222226'/><stop offset='1' stop-color='%2317171a'/></linearGradient></defs><rect width='160' height='160' fill='url(%23g)'/><text x='50%' y='54%' text-anchor='middle' font-family='Montserrat,Arial' font-weight='700' font-size='62' fill='%23d6a62a' letter-spacing='2'>${initials}</text></svg>`;
+  return 'data:image/svg+xml;utf8,'+svg.replace(/#/g,'%23').replace(/"/g,'\'');
+};
+
+// Split-panel employee detail modal (People Directory)
+window.openEmployeeDetailModal = function(emp){
+  const photo = window._empPhoto(emp, 0);
+  const sales = isSales(emp);
+  const wrap = el('div',{class:'emp-detail'});
+  wrap.innerHTML = `
+    <div class="ed-left">
+      <div class="ed-photo" style="background-image:url('${photo}')"></div>
+      <div class="ed-meta">
+        <div class="ed-name">${emp.name||'—'}</div>
+        ${sales && emp.pseudoName?`<div class="ed-pseudo">aka ${emp.pseudoName}</div>`:''}
+        <div class="ed-id">ID · ${emp.empId||'—'}</div>
+        <span class="ed-dept">${emp.dept||'—'}</span>
+      </div>
+    </div>
+    <div class="ed-right">
+      <div class="form-grid cols-2">
+        <div><label>Full Name</label><input id="edName" value="${emp.name||''}"/></div>
+        <div><label>Pseudo Name (Sales)</label><input id="edPseudo" value="${emp.pseudoName||''}"/></div>
+        <div><label>Designation</label><input id="edTitle" value="${emp.title||''}"/></div>
+        <div><label>Department</label><select id="edDept">${VECLAR.DEPARTMENTS.map(d=>`<option ${d===emp.dept?'selected':''}>${d}</option>`).join('')}</select></div>
+        <div><label>Email</label><input id="edEmail" value="${emp.email||''}"/></div>
+        <div><label>Contact Number</label><input id="edPhone" value="${emp.phone||''}"/></div>
+        <div><label>CNIC</label><input id="edCnic" value="${emp.cnic||''}"/></div>
+        <div><label>Gender</label><select id="edGender"><option value=""></option><option ${emp.gender==='M'?'selected':''}>M</option><option ${emp.gender==='F'?'selected':''}>F</option><option ${emp.gender==='Other'?'selected':''}>Other</option></select></div>
+        <div><label>Date of Birth</label><input id="edDob" type="date" value="${emp.dob||''}"/></div>
+        <div><label>Join Date</label><input id="edJoin" type="date" value="${emp.joinDate||''}"/></div>
+        <div><label>Address</label><input id="edAddr" value="${emp.address||''}"/></div>
+        <div><label>Emergency Contact</label><input id="edEmerg" value="${emp.emergency||''}"/></div>
+        <div><label>Bank</label><input id="edBank" value="${emp.bank||''}"/></div>
+        <div><label>IBAN</label><input id="edIban" value="${emp.iban||''}"/></div>
+        <div><label>Basic Salary (PKR)</label><input id="edSal" type="number" value="${emp.basicSalary||0}"/></div>
+        <div><label>Status</label><select id="edStatus"><option ${emp.status!=='Old'?'selected':''}>Active</option><option ${emp.status==='Old'?'selected':''}>Old</option></select></div>
+      </div>
+      <div class="row" style="margin-top:18px;gap:10px;flex-wrap:wrap">
+        <button class="gold-btn" id="edSave" style="max-width:200px">Save Changes</button>
+        <button class="ghost-btn" type="button" onclick="closeModal()">Close</button>
+      </div>
+    </div>`;
+  modal(wrap, '');
+  document.getElementById('edSave').addEventListener('click', async (ev)=>{
+    await withSpinner(ev.currentTarget, async ()=>{
+      let sal = Number(document.getElementById('edSal').value)||0;
+      const deptVal = document.getElementById('edDept').value;
+      if (deptVal==='Sales' && sal < VECLAR.MIN_BASIC_SALARY){
+        toast(`Minimum basic salary for Sales is ${fmtMoney(VECLAR.MIN_BASIC_SALARY)}`,'bad');
+        sal = VECLAR.MIN_BASIC_SALARY;
+      }
+      const payload = Object.assign({}, emp, {
+        empId: emp.empId,
+        name: document.getElementById('edName').value.trim(),
+        pseudoName: document.getElementById('edPseudo').value.trim(),
+        title: document.getElementById('edTitle').value.trim(),
+        dept: deptVal,
+        email: document.getElementById('edEmail').value.trim(),
+        phone: document.getElementById('edPhone').value.trim(),
+        cnic: document.getElementById('edCnic').value.trim(),
+        gender: document.getElementById('edGender').value,
+        dob: document.getElementById('edDob').value,
+        joinDate: document.getElementById('edJoin').value,
+        address: document.getElementById('edAddr').value.trim(),
+        emergency: document.getElementById('edEmerg').value.trim(),
+        bank: document.getElementById('edBank').value.trim(),
+        iban: document.getElementById('edIban').value.trim(),
+        basicSalary: sal,
+        status: document.getElementById('edStatus').value
+      });
+      const r = await api('upsertEmployee',{payload:JSON.stringify(payload)});
+      if (r.ok){ toast('Employee saved','ok'); closeModal(); RENDERERS.people&&RENDERERS.people(); }
+      else toast(r.error||'Failed','bad');
+    });
+  });
+};
+
+RENDERERS.people = async function(){
+  const v = $('view-people'); v.innerHTML='';
+  v.innerHTML = `<div class="hero"><div><h1>People <b>Directory</b></h1><div class="sub">All employees across ${VECLAR.DEPARTMENTS.length} departments</div></div>
+    <button class="gold-btn" style="max-width:180px" onclick="openEmployeeForm()">+ Add Employee</button></div>`;
+  const allEmps = (await api('listEmployees',{})).data||[];
+
+  const filt = el('div',{class:'panel'});
+  filt.innerHTML = `<h3><span class="accent"></span>Filter
+    <span class="actions">
+      <button class="ghost-btn" data-view="grid">Grid</button>
+      <button class="ghost-btn" data-view="cards">Cards</button>
+      <button class="ghost-btn" data-view="table">Table</button>
+    </span></h3>
+    <div class="form-grid cols-3">
+      <div><label>Status</label><select id="fStatus"><option value="Active">Active</option><option value="Old">Old Employees</option><option value="">All</option></select></div>
+      <div><label>Department</label><select id="fDept"><option value="">All</option>${VECLAR.DEPARTMENTS.map(d=>`<option>${d}</option>`).join('')}</select></div>
+      <div><label>Search</label><input id="fSearch" placeholder="Name, pseudo, contact"/></div>
+    </div>`;
+  v.appendChild(filt);
+  filt.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>{ PEOPLE_VIEW=b.dataset.view; render(); }));
+
+  const grid = el('div',{class:'panel', id:'pplGrid'});
+  v.appendChild(grid);
+
+  function empCard(e, idx){
+    const c = el('div',{class:'pay-card emp-pay-card'});
+    c.addEventListener('click',()=>openEmployeeDetailModal(e));
+    const photo = window._empPhoto(e, idx||0);
+    const sales = isSales(e);
+    return Object.assign(c, {innerHTML: `
+      <div class="bg" style="background-image:url('${photo}')"></div>
+      <span class="pill ${e.status==='Old'?'unpaid':''}">${e.status==='Old'?'OLD':e.dept}</span>
+      <div class="body">
+        <div class="pname">${e.name||'—'}</div>
+        ${sales && e.pseudoName ? `<div class="ppseudo">aka ${e.pseudoName}</div>` : `<div class="ppseudo" style="opacity:.6">${e.empId||''}</div>`}
+        <div class="prow"><span class="pk">ID</span><span class="pv">${e.empId||'—'}</span></div>
+        <div class="prow"><span class="pk">Title</span><span class="pv" style="font-weight:400;text-transform:none;letter-spacing:.02em">${e.title||'—'}</span></div>
+        <div class="prow"><span class="pk">Contact</span><span class="pv" style="font-weight:400">${e.phone||'—'}</span></div>
+        <div class="prow"><span class="pk">Joined</span><span class="pv">${fmtDate(e.joinDate)}</span></div>
+        <div class="pnet"><span class="pk">SALARY</span><span class="pv">${fmtMoney(e.basicSalary)}</span></div>
+      </div>`});
+  }
+
+  function render(){
+    const dq = $('fDept').value, sq = ($('fSearch').value||'').toLowerCase(), st=$('fStatus').value;
+    const list = allEmps.filter(e =>
+      (!dq||e.dept===dq) &&
+      (!st || (st==='Active'? e.status!=='Old' : e.status==='Old')) &&
+      (!sq || (`${e.name} ${e.pseudoName||''} ${e.email||''} ${e.phone||''}`).toLowerCase().includes(sq))
+    );
+    grid.innerHTML = `<h3><span class="accent"></span>${list.length} ${st==='Old'?'old ':''}employees · ${PEOPLE_VIEW.toUpperCase()} view</h3>`;
+    if (PEOPLE_VIEW==='table'){
+      const t = el('div',{class:'scroll-x'});
+      t.innerHTML = `<table class="tbl"><thead><tr><th>ID</th><th>Name</th><th>Pseudo</th><th>Dept</th><th>Title</th><th>Contact</th><th>Salary</th><th>Status</th></tr></thead><tbody>${
+        list.map(e=>`<tr onclick='openEmployeeDetailModal(${JSON.stringify(e).replace(/'/g,"&apos;")})' style="cursor:pointer">
+          <td>${e.empId}</td><td>${e.name}</td><td>${e.pseudoName||'—'}</td><td>${e.dept}</td><td>${e.title||'—'}</td>
+          <td>${e.phone||'—'}</td><td>${fmtMoney(e.basicSalary)}</td>
+          <td><span class="pill ${e.status==='Old'?'bad':'ok'}">${e.status||'Active'}</span></td></tr>`).join('')
+      }</tbody></table>`;
+      grid.appendChild(t);
+    } else if (PEOPLE_VIEW==='grid'){
+      const g = el('div',{class:'ppl-grid pay-row-grid'});
+      list.forEach((e,i)=>g.appendChild(empCard(e,i)));
+      grid.appendChild(g);
+    } else {
+      grid.appendChild(carousel(list, empCard));
+    }
+  }
+  $('fDept').addEventListener('change',render);
+  $('fSearch').addEventListener('input',render);
+  $('fStatus').addEventListener('change',render);
+  render();
+};
+
+window.openEmployeeForm = function(emp){
+  emp = emp || {empId:'', name:'', pseudoName:'', email:'', username:'', password:'', dept:'Sales', title:'', role:'employee', joinDate:'', basicSalary:80000, phone:'', cnic:'', gender:'', dob:'', address:'', emergency:'', bank:'', iban:'', revenueMTD:0, status:'Active'};
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div class="form-grid cols-2">
+      <div><label>Employee ID</label><input id="eId" value="${emp.empId||''}" placeholder="auto if empty"/></div>
+      <div><label>Status</label><select id="eStatus"><option ${emp.status!=='Old'?'selected':''}>Active</option><option ${emp.status==='Old'?'selected':''}>Old</option></select></div>
+
+      <div class="form-section">Identity</div>
+      <div><label>Full Name</label><input id="eName" value="${emp.name||''}" required/></div>
+      <div><label>Pseudo Name (Sales)</label><input id="ePseudo" value="${emp.pseudoName||''}" placeholder="e.g. Alex Carter"/></div>
+      <div><label>CNIC</label><input id="eCnic" value="${emp.cnic||''}"/></div>
+      <div><label>Gender</label><select id="eGender"><option value=""></option><option ${emp.gender==='M'?'selected':''}>M</option><option ${emp.gender==='F'?'selected':''}>F</option><option ${emp.gender==='Other'?'selected':''}>Other</option></select></div>
+      <div><label>Date of Birth</label><input id="eDob" type="date" value="${emp.dob||''}"/></div>
+      <div><label>Address</label><input id="eAddr" value="${emp.address||''}"/></div>
+
+      <div class="form-section">Contact</div>
+      <div><label>Email</label><input id="eEmail" type="email" value="${emp.email||''}" required/></div>
+      <div><label>Contact Number</label><input id="ePhone" value="${emp.phone||''}"/></div>
+      <div><label>Emergency Contact</label><input id="eEmerg" value="${emp.emergency||''}"/></div>
+      <div><label>Username</label><input id="eUser" value="${emp.username||''}"/></div>
+      <div><label>Password</label><input id="ePass" type="text" value="${emp.password||''}"/></div>
+
+      <div class="form-section">Employment</div>
+      <div><label>Department</label><select id="eDept">${VECLAR.DEPARTMENTS.map(d=>`<option ${d===emp.dept?'selected':''}>${d}</option>`).join('')}</select></div>
+      <div><label>Designation</label><input id="eTitle" value="${emp.title||''}"/></div>
+      <div><label>Role</label><select id="eRole"><option value="employee" ${emp.role==='employee'?'selected':''}>Employee</option><option value="admin" ${emp.role==='admin'?'selected':''}>Admin / HR</option></select></div>
+      <div><label>Join Date</label><input id="eJoin" type="date" value="${emp.joinDate||''}"/></div>
+      <div><label>ZK Device Emp ID</label><input id="eZk" value="${emp.zkEmpId||''}" placeholder="e.g. 11"/></div>
+
+      <div class="form-section">Compensation</div>
+      <div><label>Basic Salary (PKR${isSales({dept:emp.dept})?`, min ${VECLAR.MIN_BASIC_SALARY.toLocaleString()} (Sales)`:''})</label><input id="eSal" type="number" min="0" value="${emp.basicSalary||0}"/></div>
+      <div><label>Bank</label><input id="eBank" value="${emp.bank||''}"/></div>
+      <div><label>IBAN</label><input id="eIban" value="${emp.iban||''}"/></div>
+    </div>
+    <div class="row" style="margin-top:18px">
+      <button class="gold-btn" id="eSave" style="max-width:200px">Save</button>
+      ${emp.empId?`<button class="danger-btn" id="eDelete" type="button">Delete Employee</button>`:''}
+    </div>
+    ${isSales({dept:emp.dept})?`<div class="hint" style="text-align:left;color:#bbb;margin-top:14px">Sales rule: revenue ≥ $${VECLAR.SALES_REV_BUMP} bumps base to ${fmtMoney(VECLAR.SALES_BASE_HIGH)}. Commission 15% on $${VECLAR.SALES_COMM_T1_FROM}–$${VECLAR.SALES_COMM_T2_FROM-1}, 20% above $${VECLAR.SALES_COMM_T2_FROM}. Team Leads/Heads earn basic + team commissions.</div>`:''}`;
+  modal(wrap, emp.empId ? `Edit ${emp.name}` : 'Add Employee');
+  $('eSave').addEventListener('click', async (ev)=>{
+    await withSpinner(ev.currentTarget, async ()=>{
+      let sal = Number($('eSal').value)||0;
+      const deptVal = $('eDept').value;
+      if (deptVal==='Sales' && sal < VECLAR.MIN_BASIC_SALARY){ toast(`Minimum basic salary for Sales is ${fmtMoney(VECLAR.MIN_BASIC_SALARY)}`,'bad'); sal = VECLAR.MIN_BASIC_SALARY; }
+      const payload = {
+        empId:$('eId').value.trim(), name:$('eName').value.trim(), pseudoName:$('ePseudo').value.trim(),
+        email:$('eEmail').value.trim(), username:$('eUser').value.trim(), password:$('ePass').value, phone:$('ePhone').value.trim(),
+        dept:$('eDept').value, title:$('eTitle').value.trim(), role:$('eRole').value,
+        joinDate:$('eJoin').value, basicSalary:sal,
+        cnic:$('eCnic').value.trim(), gender:$('eGender').value, dob:$('eDob').value, address:$('eAddr').value.trim(),
+        emergency:$('eEmerg').value.trim(), bank:$('eBank').value.trim(), iban:$('eIban').value.trim(),
+        zkEmpId:$('eZk').value.trim(),
+        status:$('eStatus').value
+      };
+      const r = await api('upsertEmployee',{payload:JSON.stringify(payload)});
+      if (r.ok){ toast('Employee saved','ok'); closeModal(); RENDERERS.people&&RENDERERS.people(); }
+      else toast(r.error||'Failed','bad');
+    });
+  });
+  if (emp.empId){
+    $('eDelete').addEventListener('click', ()=>openDepartureForm(emp));
+  }
+};
+
+window.openDepartureForm = function(emp){
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div class="hint" style="text-align:left;color:#ffb0b1;margin-bottom:14px">This will move <b style="color:#fff">${emp.name}</b> to <b style="color:var(--gold)">Old Employees</b>. The record stays in archives.</div>
+    <div class="form-grid cols-2">
+      <div><label>Departure Type</label>
+        <select id="dType">
+          <option>Termination</option>
+          <option>Resignation</option>
+          <option>Left without notice</option>
+        </select>
+      </div>
+      <div><label>Effective Date</label><input id="dDate" type="date" value="${todayKey()}" required/></div>
+      <div style="grid-column:1/-1"><label>Note (optional)</label><textarea id="dNote" placeholder="Reason / handover notes…"></textarea></div>
+    </div>
+    <div class="row" style="margin-top:18px">
+      <button class="danger-btn" id="dGo" style="max-width:240px">Confirm Departure</button>
+      <button class="ghost-btn" type="button" onclick="closeModal()">Cancel</button>
+    </div>`;
+  modal(wrap, `Delete ${emp.name}`);
+  $('dGo').addEventListener('click', async (ev)=>{
+    await withSpinner(ev.currentTarget, async ()=>{
+      const r = await api('departEmployee',{empId:emp.empId, type:$('dType').value, date:$('dDate').value, note:$('dNote').value.trim()});
+      if (r.ok){ toast('Moved to Old Employees','ok'); closeModal(); RENDERERS.people&&RENDERERS.people(); }
+      else toast(r.error||'Failed','bad');
+    });
+  });
+};
+
+/* ---- Admin: Attendance (comprehensive) ---- */
+RENDERERS['admin-attendance'] = async function(){
+  const v = $('view-admin-attendance'); v.innerHTML='';
+  v.innerHTML = `<div class="hero"><div><h1>Attendance <b>Overview</b></h1>
+    <div class="sub">ZKTeco K50 import · Shift ${VECLAR.SHIFT.start}–${VECLAR.SHIFT.end} · Mon–Fri working</div></div></div>`;
+
+  // Controls
+  const ctl = el('div',{class:'panel'});
+  const today = new Date();
+  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+  ctl.innerHTML = `<h3><span class="accent"></span>Period
+    <span class="actions">
+      <label class="ghost-btn" style="cursor:pointer">Import .xls
+        <input id="zkFile" type="file" accept=".xls,.xlsx" style="display:none"/></label>
+      <button class="ghost-btn" id="exCsv">Export CSV</button>
+    </span></h3>
+    <div class="form-grid cols-3">
+      <div><label>From</label><input type="date" id="aFrom" value="${todayKey(monthStart)}"/></div>
+      <div><label>To</label><input type="date" id="aTo" value="${todayKey(today)}"/></div>
+      <div><label>Department</label><select id="aDeptF"><option value="">All</option>${VECLAR.DEPARTMENTS.map(d=>`<option>${d}</option>`).join('')}</select></div>
+    </div>`;
+  v.appendChild(ctl);
+
+  // Stat cards
+  const kpis = el('div',{class:'kpis', id:'attKpis'});
+  v.appendChild(kpis);
+
+  // Two-col: status chart + late-by-day chart
+  const grid = el('div',{class:'grid-2'});
+  const statusPanel = el('div',{class:'panel'});
+  statusPanel.innerHTML = `<h3><span class="accent"></span>Status Breakdown</h3><div id="statusChart"></div>`;
+  const trendPanel = el('div',{class:'panel'});
+  trendPanel.innerHTML = `<h3><span class="accent"></span>Daily Presence</h3><div id="trendChart" style="display:flex;gap:4px;align-items:flex-end;height:140px"></div>`;
+  grid.append(statusPanel, trendPanel);
+  v.appendChild(grid);
+
+  // Records table
+  const tablePanel = el('div',{class:'panel'});
+  tablePanel.innerHTML = `<h3><span class="accent"></span>Records</h3>
+    <div class="scroll-x"><table class="tbl" id="aTbl"><thead><tr>
+      <th>Date</th><th>Employee</th><th>Dept</th><th>Check In</th><th>Check Out</th><th>Status</th><th>Source</th><th>Leave</th><th>Action</th>
+    </tr></thead><tbody></tbody></table></div>`;
+  v.appendChild(tablePanel);
+
+  async function load(){
+    const from=$('aFrom').value, to=$('aTo').value, dept=$('aDeptF').value;
+    const emps = (await api('listEmployees',{})).data||[];
+    const att = (await api('listAttendance',{from, to})).data||[];
+    const reqs = (await api('listRequests',{})).data||[];
+
+    // Index leave requests by emp+date
+    const lvIdx = {};
+    reqs.filter(r=>(r.type||'').includes('Leave')).forEach(r=>{ lvIdx[r.empId+'|'+r.date]=r; });
+
+    // Annotate
+    const enriched = att.map(a=>{
+      const lv = lvIdx[a.empId+'|'+a.date];
+      return {...a, leaveStatus: lv?lv.status:undefined, leaveType: lv?lv.type:undefined, leaveId: lv?lv.id:undefined};
+    });
+
+    const filt = enriched.filter(a=>{ const e=emps.find(x=>x.empId===a.empId); return e && (!dept||e.dept===dept); });
+
+    // KPIs
+    let p=0,l=0,h=0,lp=0,lu=0,a0=0;
+    filt.forEach(rec=>{
+      const e=emps.find(x=>x.empId===rec.empId);
+      const st=attendanceStatus(rec,e);
+      if(st.code==='P')p++; else if(st.code==='L')l++; else if(st.code==='H')h++;
+      else if(st.code==='LP')lp++; else if(st.code==='LU'||st.code==='LX')lu++; else a0++;
+    });
+    kpis.innerHTML='';
+    [
+      {l:'Records', n:filt.length, d:`${from} → ${to}`},
+      {l:'Present', n:p, d:'On time'},
+      {l:'Late', n:l, d:`After ${VECLAR.PRESENT_UNTIL}`, down:l>0},
+      {l:'Half Day', n:h, d:`After ${VECLAR.LATE_UNTIL}`, down:h>0},
+      {l:'Paid Leaves', n:lp, d:'Approved'},
+      {l:'Unpaid / Pending', n:lu, d:'Leaves', down:lu>0}
+    ].forEach(k=>{
+      const c=el('div',{class:'kpi'});
+      c.innerHTML=`<div class="lbl"><span class="ic">●</span>${k.l}</div><div class="num">${k.n}</div><div class="delta ${k.down?'down':''}">${k.d}</div>`;
+      kpis.appendChild(c);
+    });
+
+    // Status chart
+    const sc = $('statusChart'); sc.innerHTML='';
+    const total = Math.max(1, p+l+h+lp+lu+a0);
+    [['Present',p,'ok'],['Late',l,'warn'],['Half Day',h,'warn'],['Paid Leave',lp,'info'],['Unpaid Leave',lu,'bad'],['Absent',a0,'bad']].forEach(([lbl,n,cl])=>{
+      const row = el('div',{class:'bar-row'});
+      row.innerHTML = `<span class="lbl">${lbl}</span><div class="bar"><span style="width:${n/total*100}%;background:${cl==='ok'?'linear-gradient(90deg,#7adf8a,#4cc46a)':cl==='warn'?'linear-gradient(90deg,#f5c451,#d99a1a)':cl==='info'?'linear-gradient(90deg,#7ab7ff,#3a7bd8)':'linear-gradient(90deg,#ff8e8e,#d44b4b)'}"></span></div><span class="num">${n}</span>`;
+      sc.appendChild(row);
+    });
+
+    // Trend by date
+    const tc = $('trendChart'); tc.innerHTML='';
+    const byDay = {};
+    filt.forEach(r=>{ byDay[r.date]=(byDay[r.date]||0)+1; });
+    const dayKeys = Object.keys(byDay).sort();
+    const maxN = Math.max(1,...Object.values(byDay));
+    dayKeys.slice(-30).forEach(d=>{
+      const h=byDay[d]/maxN*100;
+      const bar=el('div',{title:`${d}: ${byDay[d]}`,style:`flex:1;min-width:6px;height:${h}%;background:linear-gradient(180deg,var(--gold-soft),var(--gold-dim));border-radius:3px 3px 0 0`});
+      tc.appendChild(bar);
+    });
+    if (!dayKeys.length) tc.innerHTML = '<span style="color:#666;font-size:12px">No data</span>';
+
+    // Table
+    const tb = $('aTbl').querySelector('tbody'); tb.innerHTML='';
+    filt.sort((a,b)=>a.date<b.date?1:-1).slice(0,300).forEach(rec=>{
+      const e=emps.find(x=>x.empId===rec.empId);
+      const st=attendanceStatus(rec,e);
+      let leaveCell = '—';
+      if (rec.leaveStatus){
+        if (rec.leaveStatus==='Pending'){
+          leaveCell = `<span class="pill warn">Pending</span> <button class="ghost-btn" data-id="${rec.leaveId}" data-act="approve" style="padding:4px 8px;font-size:10px">Approve</button> <button class="ghost-btn" data-id="${rec.leaveId}" data-act="reject" style="padding:4px 8px;font-size:10px">Reject</button>`;
+        } else {
+          leaveCell = `<span class="pill ${rec.leaveStatus==='Approved'?'ok':'bad'}">${rec.leaveType||'Leave'} · ${rec.leaveStatus}</span>`;
+        }
+      }
+      const pi = piFor(rec.empId);
+      const isWaivable = (st.code==='L' || st.code==='H');
+      const isWaived = pi.waivedDates && pi.waivedDates.indexOf(rec.date)>=0;
+      let actionCell = '—';
+      if (isWaivable){
+        actionCell = isWaived
+          ? `<span class="pill ok">Waived</span> <button class="ghost-btn" data-emp="${rec.empId}" data-date="${rec.date}" data-act="unwaive" style="padding:4px 8px;font-size:10px">Undo</button>`
+          : `<button class="ghost-btn" data-emp="${rec.empId}" data-date="${rec.date}" data-act="waive" style="padding:4px 8px;font-size:10px;border-color:var(--gold);color:var(--gold)">Waive</button>`;
+      }
+      const tr = el('tr',{},
+        el('td',{}, fmtDate(rec.date)),
+        el('td',{}, e?e.name:rec.empId),
+        el('td',{}, e?e.dept:'—'),
+        el('td',{}, fmtTime(rec.checkIn)),
+        el('td',{}, fmtTime(rec.checkOut)),
+        el('td',{html:`<span class="pill ${st.cls==='ok'?'ok':st.cls==='warn'?'warn':'bad'}">${st.label}${isWaived?' · Waived':''}</span>`}),
+        el('td',{}, rec.source==='zk'?'ZKTeco':'Manual'),
+        el('td',{html:leaveCell}),
+        el('td',{html:actionCell})
+      );
+      tb.appendChild(tr);
+    });
+    tb.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', async ev=>{
+      ev.stopPropagation();
+      const act=b.dataset.act;
+      if (act==='waive' || act==='unwaive'){
+        const pi = piFor(b.dataset.emp);
+        const d = b.dataset.date;
+        if (act==='waive'){ if (pi.waivedDates.indexOf(d)<0) pi.waivedDates.push(d); toast('Deductions waived — payroll updated','ok'); }
+        else { pi.waivedDates = pi.waivedDates.filter(x=>x!==d); toast('Waiver removed — payroll updated','ok'); }
+        piSave();
+        if (window.__refreshPayroll) window.__refreshPayroll();
+        load();
+        return;
+      }
+      await withSpinner(b, async ()=>{
+        const id=b.dataset.id;
+        const remarks = act==='approve'?'Approved from attendance':'Rejected from attendance';
+        const r = await api(act==='approve'?'approveRequest':'rejectRequest',{id, remarks});
+        if (r.ok){ toast(act==='approve'?'Leave approved (Paid)':'Leave rejected (Unpaid)','ok'); load(); }
+        else toast('Failed','bad');
+      });
+    }));
+
+    // Export CSV
+    $('exCsv').onclick = ()=>{
+      const rows = [['Date','Employee','Dept','Check In','Check Out','Status','Source','Leave']];
+      filt.forEach(rec=>{
+        const e=emps.find(x=>x.empId===rec.empId);
+        const st=attendanceStatus(rec,e);
+        rows.push([rec.date, e?e.name:rec.empId, e?e.dept:'', fmtTime(rec.checkIn), fmtTime(rec.checkOut), st.label, rec.source||'manual', rec.leaveStatus||'']);
+      });
+      const csv = rows.map(r=>r.map(x=>`"${(x==null?'':String(x)).replace(/"/g,'""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv],{type:'text/csv'});
+      const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`attendance-${from}_${to}.csv`; a.click();
+    };
+  }
+
+  // ZKTeco import
+  $('zkFile').addEventListener('change', async ev=>{
+    const file = ev.target.files[0]; if (!file) return;
+    const lbl = ev.target.parentElement;
+    const old = lbl.innerHTML;
+    lbl.innerHTML = '<span class="btn-spinner"></span> Parsing…';
+    try{
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, {cellDates:true});
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, {defval:'', raw:true});
+      const emps = (await api('listEmployees',{})).data||[];
+      const empByZk = {}; emps.forEach(e=>{ if (e.zkEmpId) empByZk[String(e.zkEmpId).trim()] = e.empId; });
+      // Build pairs by emp+shiftDate (shift 18:00–03:00 next day; in/out belong to same shift starting that evening)
+      const pairs = {}; // key: empId|shiftDate
+      let unmapped = 0;
+      rows.forEach(r=>{
+        const zk = String(r['EMP ID']||r['Emp ID']||r['EmpId']||'').trim();
+        if (!zk) return;
+        const empId = empByZk[zk];
+        if (!empId){ unmapped++; return; }
+        const dateRaw = r['Date'], timeRaw = r['Time'];
+        const dt = parseZkDateTime(dateRaw, timeRaw);
+        if (!dt) return;
+        const state = String(r['State']||'').toLowerCase();
+        // Shift-date: any timestamp before 14:00 belongs to previous evening's shift
+        const shiftDate = new Date(dt);
+        if (dt.getHours() < 14) shiftDate.setDate(shiftDate.getDate()-1);
+        const sd = todayKey(shiftDate);
+        const key = empId+'|'+sd;
+        const slot = pairs[key] = pairs[key] || {empId, date:sd, checkIn:null, checkOut:null};
+        if (state.includes('in')){
+          if (!slot.checkIn || new Date(slot.checkIn) > dt) slot.checkIn = dt.toISOString();
+        } else if (state.includes('out')){
+          if (!slot.checkOut || new Date(slot.checkOut) < dt) slot.checkOut = dt.toISOString();
+        } else {
+          // unknown state → treat first as in, later as out
+          if (!slot.checkIn) slot.checkIn = dt.toISOString();
+          else slot.checkOut = dt.toISOString();
+        }
+      });
+      const list = Object.values(pairs);
+      const r = await api('importAttendance',{payload:JSON.stringify(list)});
+      if (r.ok){ toast(`Imported ${r.data.total} records · ${unmapped} unmapped (set ZK Emp ID on profile)`,'ok'); load(); }
+      else toast('Import failed','bad');
+    }catch(err){
+      console.error(err); toast('Could not parse file','bad');
+    }
+    lbl.innerHTML = old;
+    // re-bind input
+    $('zkFile').value='';
+  });
+
+  $('aFrom').addEventListener('change',load);
+  $('aTo').addEventListener('change',load);
+  $('aDeptF').addEventListener('change',load);
+  load();
+};
+
+function parseZkDateTime(dateRaw, timeRaw){
+  // Date can be: 'DD-MM-YYYY' string, Date object, or Excel-decoded Date
+  let y, mo, d;
+  if (dateRaw instanceof Date && !isNaN(dateRaw)){
+    y = dateRaw.getFullYear(); mo = dateRaw.getMonth(); d = dateRaw.getDate();
+  } else if (typeof dateRaw === 'string'){
+    const m = dateRaw.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})$/);
+    if (!m) return null;
+    d = +m[1]; mo = +m[2]-1; y = +m[3]; if (y<100) y+=2000;
+  } else return null;
+  // Time: time object {hours,minutes,seconds} or string 'HH:MM:SS' or Date
+  let hh=0, mm=0, ss=0;
+  if (timeRaw instanceof Date && !isNaN(timeRaw)){
+    hh=timeRaw.getHours(); mm=timeRaw.getMinutes(); ss=timeRaw.getSeconds();
+  } else if (typeof timeRaw === 'string'){
+    const t = timeRaw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (t){ hh=+t[1]; mm=+t[2]; ss=+(t[3]||0); }
+  } else if (timeRaw && typeof timeRaw === 'object' && 'hours' in timeRaw){
+    hh=timeRaw.hours||0; mm=timeRaw.minutes||0; ss=timeRaw.seconds||0;
+  }
+  return new Date(y, mo, d, hh, mm, ss);
+}
+
+/* ---- Admin: Requests ---- */
+RENDERERS['admin-requests'] = async function(){
+  const v = $('view-admin-requests'); v.innerHTML='';
+  v.innerHTML = `<div class="hero"><div><h1>Requests <b>Queue</b></h1><div class="sub">Approve, reject and track HR requests</div></div></div>`;
+  const reqs = (await api('listRequests',{})).data||[];
+  const total = reqs.length;
+  const pending = reqs.filter(r=>r.status==='Pending').length;
+  const panel = el('div',{class:'panel'});
+  panel.innerHTML = `<h3><span class="accent"></span>Request Categories <span class="actions"><span class="pill">${pending} pending</span><span class="pill" style="margin-left:6px">${total} total</span></span></h3><div id="reqCatGridAdmin"></div>`;
+  v.appendChild(panel);
+  $('reqCatGridAdmin').appendChild(buildRequestTypeGrid(reqs, {admin:true}));
+};
+
+/* ---- Requests: shared category grid + modal ---- */
+window.REQ_TYPE_IMG = {
+  'Casual Leave':'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=600&q=60',
+  'Sick Leave':'https://images.unsplash.com/photo-1580281658626-ee379f3cce93?auto=format&fit=crop&w=600&q=60',
+  'Late Coming':'https://images.unsplash.com/photo-1501139083538-0139583c060f?auto=format&fit=crop&w=600&q=60',
+  'Half Day':'https://images.unsplash.com/photo-1506784983877-45594efa4cbe?auto=format&fit=crop&w=600&q=60',
+  'Advance Salary':'https://images.unsplash.com/photo-1554224155-6726b3ff858f?auto=format&fit=crop&w=600&q=60',
+  'Waiver Appeal':'https://images.unsplash.com/photo-1450101499163-c8848c66ca85?auto=format&fit=crop&w=600&q=60',
+  'Salary Slip':'https://images.unsplash.com/photo-1554224154-22dec7ec8818?auto=format&fit=crop&w=600&q=60',
+  'Experience Letter':'https://images.unsplash.com/photo-1517842645767-c639042777db?auto=format&fit=crop&w=600&q=60',
+  'Bank Opening Letter':'https://images.unsplash.com/photo-1520607162513-77705c0f0d4a?auto=format&fit=crop&w=600&q=60',
+  'Custom Requests':'https://images.unsplash.com/photo-1553877522-43269d4ea984?auto=format&fit=crop&w=600&q=60',
+  _default:'https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?auto=format&fit=crop&w=600&q=60'
+};
+
+function buildRequestTypeGrid(allReqs, opts){
+  // Outer wrapper holds filter + grid; this function returns a fragment-like div.
+  const wrap = el('div',{class:'req-type-wrap'});
+  // 30-day visibility window (chat is visible up to 30 days).
+  const since30 = Date.now() - 86400000*30;
+  const visible = (allReqs||[]).filter(r => new Date(r.createdAt||r.date||0).getTime() >= since30);
+
+  const filt = el('div',{class:'req-cat-filter'});
+  filt.innerHTML = `
+    <input id="rcSearch" placeholder="Search employee, type or reason…" />
+    <select id="rcStatus">
+      <option value="">All statuses</option>
+      <option value="Pending">Pending</option>
+      <option value="Approved">Approved</option>
+      <option value="Rejected">Rejected</option>
+      <option value="Quoted">Quoted</option>
+    </select>
+    <select id="rcPriority">
+      <option value="">All priorities</option>
+      <option value="Normal">Normal</option>
+      <option value="Urgent">Urgent</option>
+    </select>`;
+  wrap.appendChild(filt);
+
+  const g = el('div',{class:'ppl-grid pay-row-grid req-type-grid'});
+  wrap.appendChild(g);
+
+  // Build a quick employee lookup so search-by-name works.
+  let _empsCache = null;
+  async function ensureEmps(){
+    if (_empsCache) return _empsCache;
+    try { _empsCache = (await api('listEmployees',{})).data || []; }
+    catch(_) { _empsCache = []; }
+    return _empsCache;
+  }
+
+  function applyFilter(reqs, emps){
+    const q = (filt.querySelector('#rcSearch').value||'').trim().toLowerCase();
+    const st = filt.querySelector('#rcStatus').value;
+    const pr = filt.querySelector('#rcPriority').value;
+    return reqs.filter(r=>{
+      if (st && (r.status||'Pending')!==st) return false;
+      if (pr && (r.priority||'Normal')!==pr) return false;
+      if (q){
+        const emp = emps.find(e=>e.empId===r.empId);
+        const name = emp ? (emp.name||'') : '';
+        const hay = `${r.type||''} ${r.reason||''} ${r.empId||''} ${name} ${r.remarks||''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+  async function paint(){
+    const emps = await ensureEmps();
+    const filtered = applyFilter(visible, emps);
+    const anyFilter = !!(filt.querySelector('#rcSearch').value||filt.querySelector('#rcStatus').value||filt.querySelector('#rcPriority').value);
+    g.innerHTML='';
+    let shown = 0;
+    VECLAR.REQUEST_TYPES.forEach((t,i)=>{
+      const list = filtered.filter(r=>r.type===t);
+      if (anyFilter && list.length===0) return; // hide empty categories when filtering
+      const pending = list.filter(r=>r.status==='Pending').length;
+      const c = el('div',{class:'pay-card req-type-card'});
+      c.style.animationDelay = (i*55)+'ms';
+      const img = window.REQ_TYPE_IMG[t] || window.REQ_TYPE_IMG._default;
+      c.innerHTML = `
+        <div class="bg" style="background-image:url('${img}')"></div>
+        <span class="pill ${pending?'unpaid':''}">${pending} PENDING</span>
+        <div class="body">
+          <div class="pname">${t}</div>
+          <div class="ppseudo">${list.length} in last 30 days</div>
+          <div class="pnet"><span class="pk">PENDING</span><span class="pv">${pending}</span></div>
+        </div>`;
+      c.addEventListener('click',()=>openRequestTypeModal(t, opts));
+      g.appendChild(c);
+      shown++;
+    });
+    if (anyFilter && shown===0){
+      g.innerHTML = `<div style="opacity:.6;padding:30px;text-align:center;grid-column:1/-1">No matching requests.</div>`;
+    }
+  }
+  filt.querySelectorAll('input,select').forEach(el2=>el2.addEventListener('input', paint));
+  paint();
+  return wrap;
+}
+
+window.openRequestTypeModal = async function(type, opts){
+  opts = opts||{};
+  const emps = (await api('listEmployees',{})).data||[];
+  let allReqs = (await api('listRequests',{})).data||[];
+  if (opts.empId) allReqs = allReqs.filter(r=>r.empId===opts.empId);
+  // 30-day visibility window
+  const since30 = Date.now() - 86400000*30;
+  allReqs = allReqs.filter(r => new Date(r.createdAt||r.date||0).getTime() >= since30);
+  const typeReqs = allReqs.filter(r=>r.type===type);
+
+  const wrap = el('div',{class:'req-type-modal'});
+  wrap.innerHTML = `
+    <div class="rt-head">
+      <div class="rt-title">${type}</div>
+      <div class="rt-filters">
+        <div><label>Start Period</label><input type="date" id="rtStart"/></div>
+        <div><label>End Period</label><input type="date" id="rtEnd"/></div>
+        <div><label>Status</label><select id="rtStatus">
+          <option value="">All</option>
+          <option value="Pending" selected>Pending</option>
+          <option value="Approved">Approved</option>
+          <option value="Rejected">Rejected</option>
+          <option value="Quoted">Quoted</option>
+        </select></div>
+      </div>
+    </div>
+    <div id="rtList" class="rt-list"></div>`;
+  modal(wrap, '');
+
+  function draw(){
+    const s = wrap.querySelector('#rtStart').value;
+    const e = wrap.querySelector('#rtEnd').value;
+    const st = wrap.querySelector('#rtStatus').value;
+    const list = typeReqs.filter(r=>{
+      if (st && (r.status||'Pending')!==st) return false;
+      const d = (r.date||(r.createdAt||'').slice(0,10));
+      if (s && d && d<s) return false;
+      if (e && d && d>e) return false;
+      return true;
+    }).sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
+    const host = wrap.querySelector('#rtList'); host.innerHTML='';
+    if (!list.length){ host.innerHTML = `<div style="opacity:.6;padding:30px;text-align:center">No requests found.</div>`; return; }
+    list.forEach(r=>{
+      const emp = emps.find(x=>x.empId===r.empId)||{empId:r.empId,name:r.empId};
+      host.appendChild(buildRequestRow(r, emp, opts, type));
+    });
+  }
+  ['#rtStart','#rtEnd','#rtStatus'].forEach(sel=>wrap.querySelector(sel).addEventListener('change',draw));
+  draw();
+};
+
+// Compact row card. Click → opens chat modal.
+function buildRequestRow(r, emp, opts, currentType){
+  const photo = window._empPhoto(emp, 0);
+  const initials = window._empInitials(emp.name||emp.empId);
+  const cls = r.status==='Approved'?'ok':(r.status==='Rejected'?'bad':(r.status==='Quoted'?'unpaid':'warn'));
+  const c = el('div',{class:'req-row'});
+  c.innerHTML = `
+    <div class="rr-photo" style="${emp.photo?`background-image:url('${photo}')`:''}">${emp.photo?'':initials}</div>
+    <div class="rr-main">
+      <div class="rr-name">${emp.name||r.empId}<span style="opacity:.55;font-weight:500;letter-spacing:.06em;margin-left:6px">· ${emp.empId||''}</span></div>
+      <div class="rr-sub"><b>${r.type}</b> · ${r.priority||'Normal'}${r.reason?` · ${String(r.reason).slice(0,70)}`:''}</div>
+    </div>
+    <div class="rr-date">${fmtDate(r.createdAt||r.date)}</div>
+    <div class="rr-status"><span class="badge ${cls}">${r.status||'Pending'}</span></div>`;
+  c.addEventListener('click',()=>openRequestChatModal(r, emp, opts, currentType));
+  return c;
+}
+// Backward compat
+function buildRequestCard(r, emp, allReqs, opts, currentType){ return buildRequestRow(r, emp, opts, currentType); }
+
+// Messenger-style chat modal for a single request.
+window.openRequestChatModal = function(r, emp, opts, currentType){
+  opts = opts||{};
+  const isAdmin = !!opts.admin;
+  const initials = window._empInitials(emp.name||emp.empId);
+  const photo = window._empPhoto(emp, 0);
+
+  const wrap = el('div',{class:'req-chat'});
+
+  function render(currentReq){
+    const status = currentReq.status||'Pending';
+    const closed = status!=='Pending';
+    const cls = status==='Approved'?'ok':(status==='Rejected'?'bad':(status==='Quoted'?'unpaid':'warn'));
+    const sub = `Request #${currentReq.id||'—'} · ${currentReq.type}`;
+    wrap.innerHTML = `
+      <div class="rch-head">
+        <div class="rch-photo" style="${emp.photo?`background-image:url('${photo}')`:''}">${emp.photo?'':initials}</div>
+        <div style="flex:1;min-width:0">
+          <div class="rch-name">${emp.name||currentReq.empId}</div>
+          <div class="rch-id">${sub}</div>
+        </div>
+        <span class="badge ${cls}">${status}</span>
+      </div>
+      <div class="rch-body" id="rchBody"></div>
+      <div id="rchFoot"></div>`;
+    const body = wrap.querySelector('#rchBody');
+
+    // Employee message (the original request)
+    const empMsg = el('div',{class:'msg from-emp'});
+    empMsg.innerHTML = `<div class="bubble">
+      <div class="bkv"><span>Request ID</span><span>${currentReq.id||'—'}</span></div>
+      <div class="bkv"><span>Type</span><span>${currentReq.type}</span></div>
+      <div class="bkv"><span>Priority</span><span>${currentReq.priority||'Normal'}</span></div>
+      <div class="bkv"><span>Date</span><span>${fmtDate(currentReq.date)}</span></div>
+      <div style="margin-top:8px">${(currentReq.reason||'—').replace(/</g,'&lt;')}</div>
+      <span class="bmeta">Submitted ${fmtDate(currentReq.createdAt)}${currentReq.createdAt?` · ${fmtTime(currentReq.createdAt)}`:''}</span>
+    </div>`;
+    body.appendChild(empMsg);
+
+    // Admin reply (if any)
+    if (closed){
+      const adminMsg = el('div',{class:'msg from-admin'});
+      adminMsg.innerHTML = `<div class="bubble">
+        <div class="bkv"><span>Decision</span><span>${status}</span></div>
+        ${currentReq.remarks?`<div style="margin-top:6px">${String(currentReq.remarks).replace(/</g,'&lt;')}</div>`:'<div style="margin-top:6px;opacity:.6">No remarks</div>'}
+        <span class="bmeta">Closed by admin</span>
+      </div>`;
+      body.appendChild(adminMsg);
+    }
+    body.scrollTop = body.scrollHeight;
+
+    const foot = wrap.querySelector('#rchFoot');
+    if (closed){
+      foot.innerHTML = `<div class="rch-closed">Conversation closed · ${status}</div>`;
+    } else if (isAdmin){
+      foot.innerHTML = `
+        <div class="rch-actions">
+          <textarea id="rchRemarks" placeholder="Type your response (required for Quote)…"></textarea>
+          <div class="row">
+            <button class="gold-btn" data-act="approve">Approve</button>
+            <button class="ghost-btn" data-act="reject">Reject</button>
+            <button class="ghost-btn" data-act="quote">Quote</button>
+          </div>
+        </div>`;
+      foot.querySelectorAll('[data-act]').forEach(b=>b.addEventListener('click', async (ev)=>{
+        const act = b.dataset.act;
+        const remarks = (foot.querySelector('#rchRemarks').value||'').trim();
+        if (act==='quote' && !remarks){ toast('Remarks required for Quote','bad'); return; }
+        await withSpinner(ev.currentTarget, async ()=>{
+          const action = act==='approve'?'approveRequest':(act==='reject'?'rejectRequest':'quoteRequest');
+          const res = await api(action,{id:currentReq.id, remarks});
+          if (res.ok){
+            // Push notification to employee so they see the response.
+            try { NOTIFS && NOTIFS.push && NOTIFS.push(currentReq.empId, {
+              title: 'Request '+(act==='approve'?'approved':act==='reject'?'rejected':'quoted'),
+              body: `${currentReq.type} on ${fmtDate(currentReq.date)}`,
+              link: 'requests'
+            }); } catch(_){}
+            toast('Response sent','ok');
+            // Update the request locally and re-render the chat in-place.
+            const updated = (res.data && res.data.id) ? res.data : Object.assign({}, currentReq, {
+              status: act==='approve'?'Approved':act==='reject'?'Rejected':'Quoted',
+              remarks
+            });
+            render(updated);
+            if (RENDERERS['admin-requests']) RENDERERS['admin-requests']();
+          } else toast(res.error||'Failed','bad');
+        });
+      }));
+    } else {
+      foot.innerHTML = `<div class="rch-closed">Awaiting admin response…</div>`;
+    }
+  }
+  modal(wrap, '');
+  render(r);
+};
+
+// Backward-compat shim: keep old action modal but redirect to chat modal.
+window.openRequestActionModal = function(r, act, currentType){
+  const opts = {admin:true};
+  // Try to find emp from cached lists; fallback to id-only.
+  api('listEmployees',{}).then(res=>{
+    const emp = ((res.data)||[]).find(x=>x.empId===r.empId) || {empId:r.empId, name:r.empId};
+    openRequestChatModal(r, emp, opts, currentType);
+  });
+};
+
+/* ---- Admin: Payroll ---- */
+let PAYROLL_VIEW = 'grid'; // grid | cards | table
+let PAYROLL_DEPT_FILTER = '';
+let PAYROLL_PERIOD_FILTER = ''; // '' = current cycle
+let PAYROLL_STATUS_FILTER = ''; // '' = all | 'PAID' | 'UNPAID'
+RENDERERS['admin-payroll'] = async function(){
+  const v = $('view-admin-payroll'); v.innerHTML='';
+  v.innerHTML = `<div class="hero"><div><h1>Payroll <b>Run</b></h1>
+    <div class="sub">Click any employee card to manage payroll.</div></div>
+    <button class="gold-btn" style="max-width:200px" onclick="runFullPayrollAndPrint()">Run Payroll</button></div>`;
+
+  const filt = el('div',{class:'panel'});
+  // Build period options: current + previous 6 cycles
+  const periodOpts = (()=>{
+    const opts = [];
+    const now = new Date();
+    const baseCs = new Date(now.getFullYear(), now.getMonth() + (now.getDate()<VECLAR.CYCLE_START_DAY?-1:0), VECLAR.CYCLE_START_DAY);
+    for (let i=0;i<7;i++){
+      const cs = new Date(baseCs); cs.setMonth(cs.getMonth()-i);
+      const ce = new Date(cs); ce.setMonth(ce.getMonth()+1); ce.setDate(ce.getDate()-1);
+      const key = `${cs.getFullYear()}-${pad(cs.getMonth()+1)}`;
+      const label = `${cs.toLocaleDateString(undefined,{day:'2-digit',month:'short'})} – ${ce.toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'numeric'})}${i===0?' (Current)':''}`;
+      opts.push({key,label});
+    }
+    return opts;
+  })();
+  filt.innerHTML = `<h3><span class="accent"></span>Filters & View</h3>
+    <div class="form-grid cols-3">
+      <div><label>Department</label><select id="pDept"><option value="">All Departments</option>${VECLAR.DEPARTMENTS.map(d=>`<option ${PAYROLL_DEPT_FILTER===d?'selected':''}>${d}</option>`).join('')}</select></div>
+      <div><label>Pay Period</label><select id="pPeriod">${periodOpts.map(o=>`<option value="${o.key}" ${PAYROLL_PERIOD_FILTER===o.key?'selected':''}>${o.label}</option>`).join('')}</select></div>
+      <div><label>Status</label><select id="pStatus">
+        <option value="" ${PAYROLL_STATUS_FILTER===''?'selected':''}>All</option>
+        <option value="PAID" ${PAYROLL_STATUS_FILTER==='PAID'?'selected':''}>Paid</option>
+        <option value="UNPAID" ${PAYROLL_STATUS_FILTER==='UNPAID'?'selected':''}>Unpaid</option>
+      </select></div>
+      <div><label>View</label><select id="pView">
+        <option value="grid" ${PAYROLL_VIEW==='grid'?'selected':''}>Grid (by Department)</option>
+        <option value="cards" ${PAYROLL_VIEW==='cards'?'selected':''}>Carousel</option>
+        <option value="table" ${PAYROLL_VIEW==='table'?'selected':''}>Table</option>
+      </select></div>
+    </div>`;
+  v.appendChild(filt);
+  filt.querySelector('#pDept').addEventListener('change',e=>{ PAYROLL_DEPT_FILTER=e.target.value; render(); });
+  filt.querySelector('#pPeriod').addEventListener('change',e=>{ PAYROLL_PERIOD_FILTER=e.target.value; render(); });
+  filt.querySelector('#pStatus').addEventListener('change',e=>{ PAYROLL_STATUS_FILTER=e.target.value; render(); });
+  filt.querySelector('#pView').addEventListener('change',e=>{ PAYROLL_VIEW=e.target.value; render(); });
+
+  const pp = el('div',{class:'panel', id:'payrollWrap'});
+  v.appendChild(pp);
+
+  async function compute(){
+    let emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old');
+    if (PAYROLL_DEPT_FILTER) emps = emps.filter(e=>e.dept===PAYROLL_DEPT_FILTER);
+    let result = await Promise.all(emps.map(async e=>{
+      const r = await api('computePayroll',{empId:e.empId, cycleKey: PAYROLL_PERIOD_FILTER||null});
+      return {emp:e, p:applyOverrides(e, r.data)};
+    }));
+    if (PAYROLL_STATUS_FILTER && window.__payStatusOf){
+      result = result.filter(x => window.__payStatusOf(x.emp, x.p) === PAYROLL_STATUS_FILTER);
+    }
+    return result;
+  }
+
+  // Demo portrait pool used when an employee has no photo. Cards alternate.
+  const _PAY_PHOTOS = [
+    'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=480&q=80&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=480&q=80&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=480&q=80&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1531123897727-8f129e1688ce?w=480&q=80&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1502685104226-ee32379fefbe?w=480&q=80&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1607746882042-944635dfe10e?w=480&q=80&auto=format&fit=crop'
+  ];
+  function _payPhoto(emp, idx){
+    if (emp && emp.photo) return emp.photo;
+    const key = (emp && emp.empId) ? emp.empId : String(idx||0);
+    let h = 0; for (let i=0;i<key.length;i++) h = (h*31 + key.charCodeAt(i)) >>> 0;
+    return _PAY_PHOTOS[h % _PAY_PHOTOS.length];
+  }
+  function _payStatus(emp, p){
+    const rec = window.payStatusGet ? window.payStatusGet(emp && emp.empId) : null;
+    if (rec && rec.status) return rec.status;
+    if (p && (p.status==='PAID' || p.status==='UNPAID')) return p.status;
+    if (emp && (emp.payStatus==='PAID' || emp.payStatus==='UNPAID')) return emp.payStatus;
+    // Fallback: mark a deterministic ~1-in-8 as UNPAID for demo cards.
+    const key = (emp && emp.empId) || '';
+    let h = 0; for (let i=0;i<key.length;i++) h = (h*31 + key.charCodeAt(i)) >>> 0;
+    return (h % 8 === 1) ? 'UNPAID' : 'PAID';
+  }
+  // Expose so external filters can query
+  window.__payStatusOf = _payStatus;
+
+  function payCard({emp,p}, idx){
+    const c = el('div',{class:'pay-card'});
+    const totalDed = (p.halfDed||0)+(p.absDed||0)+(p.quotaDed||0);
+    const status = _payStatus(emp,p);
+    const photo = _payPhoto(emp, idx);
+    const sales = isSales(emp);
+    const displayName = (emp.name||'Demo Employee');
+    const pseudo = emp.pseudoName || 'Harvey Oaks';
+    const lockedNow = window.payLockGet ? window.payLockGet(emp.empId) : false;
+    if (lockedNow) c.classList.add('locked');
+    c.innerHTML = `
+      <div class="bg" style="background-image:url('${photo}')"></div>
+      <button type="button" class="pay-lock" title="${lockedNow?'Unlock card':'Lock card'}" aria-label="Lock card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect class="lk-body" x="4" y="11" width="16" height="10" rx="2"/>
+          <path class="lk-shackle" d="M8 11V7a4 4 0 0 1 8 0v4"/>
+          <circle cx="12" cy="16" r="1.2" fill="currentColor"/>
+        </svg>
+      </button>
+      <div class="pay-lock-overlay"></div>
+      <button type="button" class="pill pill-btn ${status==='UNPAID'?'unpaid':''}" data-paystatus="${status}">${status}</button>
+      <div class="body">
+        <div class="pname">${displayName}</div>
+        <div class="ppseudo">${pseudo}</div>
+        <div class="prow"><span class="pk">Basic</span><span class="pv">${fmtMoney(p.basic)}</span></div>
+        ${sales?`
+          <div class="prow"><span class="pk">Revenue</span><span class="pv">${fmtUSD(p.revenue)}</span></div>
+          <div class="prow pos"><span class="pk">Commission</span><span class="pv">+${fmtMoney(p.salesCommPKR)} </span></div>
+          <div class="prow pos"><span class="pk">Weekly Commission</span><span class="pv">+${fmtMoney(p.weeklyCommPKR)}</span></div>
+        `:''}
+        <div class="prow neg"><span class="pk">Deductions</span><span class="pv">-${fmtMoney(totalDed)}</span></div>
+        <div class="pnet"><span class="pk">NET</span><span class="pv">${fmtMoney(p.net)}</span></div>
+      </div>`;
+    c.addEventListener('click',(ev)=>{
+      if (c.classList.contains('locked')) { ev.stopPropagation(); return; }
+      if (ev.target.closest('.pay-lock') || ev.target.closest('.pill-btn')) return;
+      window.openPayrollActionsModal(emp,p);
+    });
+    const pillBtn = c.querySelector('.pill-btn');
+    if (pillBtn) pillBtn.addEventListener('click', (ev)=>{
+      ev.stopPropagation();
+      if (c.classList.contains('locked')) return;
+      window.openPayStatusModal(emp, status);
+    });
+    const lockBtn = c.querySelector('.pay-lock');
+    lockBtn.addEventListener('click', (ev)=>{
+      ev.stopPropagation();
+      const isLocked = c.classList.contains('locked');
+      if (!isLocked){
+        c.classList.add('locked');
+        if (window.payLockSet) window.payLockSet(emp.empId, true);
+        toast('Card locked','ok');
+      } else {
+        // Ask for empId to unlock
+        const w = el('div');
+        w.innerHTML = `
+          <div class="hint" style="text-align:left;color:#bbb;margin-bottom:14px">Enter the Employee ID to unlock <b style="color:#fff">${emp.name}</b>'s payroll card.</div>
+          <div><label>Employee ID</label><input id="lkInput" type="text" autocomplete="off" placeholder="e.g. ${emp.empId}" style="width:100%"/></div>
+          <div class="row" style="margin-top:18px;gap:10px;flex-wrap:wrap">
+            <button class="gold-btn" id="lkOk" style="max-width:200px">Unlock</button>
+            <button class="ghost-btn" type="button" onclick="closeModal()">Cancel</button>
+          </div>`;
+        modal(w, 'Unlock Card');
+        const input = $('lkInput'); setTimeout(()=>input&&input.focus(),50);
+        function attempt(){
+          const v = ($('lkInput').value||'').trim();
+          if (v.toUpperCase() === String(emp.empId||'').toUpperCase()){
+            c.classList.remove('locked');
+            if (window.payLockSet) window.payLockSet(emp.empId, false);
+            toast('Card unlocked','ok'); closeModal();
+          } else {
+            toast('Incorrect Employee ID','bad');
+            const inp = $('lkInput'); if (inp){ inp.style.animation='none'; void inp.offsetWidth; inp.style.animation='shake .35s'; }
+          }
+        }
+        $('lkOk').addEventListener('click', attempt);
+        input && input.addEventListener('keydown', e=>{ if (e.key==='Enter') attempt(); });
+      }
+    });
+    return c;
+  }
+
+  async function render(){
+    pp.innerHTML = `<h3><span class="accent"></span>Per-Employee Estimates · ${PAYROLL_VIEW.toUpperCase()} view</h3>`;
+    pp.appendChild(el('div',{class:'hint',style:'color:#aaa'},'Loading…'));
+    const cards = await compute();
+    pp.querySelector('.hint').remove();
+    if (PAYROLL_VIEW==='table'){
+      // group by dept for table too
+      const groups = {};
+      cards.forEach(c=>{ (groups[c.emp.dept]=groups[c.emp.dept]||[]).push(c); });
+      Object.keys(groups).sort().forEach(dept=>{
+        const head = el('h4',{style:'margin:18px 0 8px;color:var(--gold);letter-spacing:.1em;font-size:12px;text-transform:uppercase'},`${dept} · ${groups[dept].length}`);
+        pp.appendChild(head);
+        const t = el('div',{class:'scroll-x'});
+        t.innerHTML = `<table class="tbl"><thead><tr><th>Name</th><th>Basic</th>${dept==='Sales'?'<th>Revenue (USD)</th><th>Sales Comm. (PKR)</th><th>Weekly Comm. (PKR)</th>':''}<th>Deductions</th><th>NET (PKR)</th></tr></thead><tbody>${
+          groups[dept].map(({emp,p})=>`<tr style="cursor:pointer" data-emp="${emp.empId}">
+            <td>${emp.name}</td><td>${fmtMoney(p.basic)}</td>
+            ${dept==='Sales'?`<td>${fmtUSD(p.revenue)}</td><td>${fmtMoney(p.salesCommPKR)}</td><td>${fmtMoney(p.weeklyCommPKR)}</td>`:''}
+            <td style="color:#ffb0b1">-${fmtMoney(p.halfDed+p.absDed+p.quotaDed)}</td>
+            <td style="color:var(--gold);font-weight:700">${fmtMoney(p.net)}</td>
+          </tr>`).join('')
+        }</tbody></table>`;
+        pp.appendChild(t);
+        t.querySelectorAll('tr[data-emp]').forEach(tr=>tr.addEventListener('click',()=>{
+          const e = cards.find(x=>x.emp.empId===tr.dataset.emp); if (e) window.openPayrollActionsModal(e.emp,e.p);
+        }));
+      });
+    } else if (PAYROLL_VIEW==='grid'){
+      // group by department
+      const groups = {};
+      cards.forEach(c=>{ (groups[c.emp.dept]=groups[c.emp.dept]||[]).push(c); });
+      const order = VECLAR.DEPARTMENTS.filter(d=>groups[d]);
+      Object.keys(groups).forEach(d=>{ if(!order.includes(d)) order.push(d); });
+      order.forEach(dept=>{
+        pp.appendChild(el('h4',{style:'margin:18px 0 10px;color:var(--gold);letter-spacing:.12em;font-size:12px;text-transform:uppercase;border-bottom:1px solid var(--gold-dim);padding-bottom:6px'},`${dept} · ${groups[dept].length} ${groups[dept].length===1?'employee':'employees'}`));
+        const g = el('div',{class:'pay-row'});
+        groups[dept].forEach((x,i)=>g.appendChild(payCard(x,i)));
+        pp.appendChild(g);
+      });
+    } else {
+      pp.appendChild(carousel(cards, payCard));
+    }
+  }
+  window.__refreshPayroll = render;
+  render();
+};
+
+/* Toggle Paid/Unpaid status confirmation modal */
+window.openPayStatusModal = function(emp, currentStatus){
+  const cur = currentStatus || (window.__payStatusOf ? window.__payStatusOf(emp,{}) : 'PAID');
+  const next = cur === 'PAID' ? 'UNPAID' : 'PAID';
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div class="hint" style="text-align:left;color:#ddd;margin-bottom:18px;font-size:14px;line-height:1.55">
+      Current status for <b style="color:#fff">${emp.name||''}</b> is set to
+      <b style="color:${cur==='PAID'?'var(--ok)':'var(--warn)'}">${cur}</b>.
+    </div>
+    <div class="row" style="margin-top:8px;gap:10px;flex-wrap:wrap">
+      <button class="gold-btn" id="psToggle" style="max-width:220px">Mark as ${next}</button>
+      <button class="ghost-btn" type="button" onclick="closeModal()">Go Back</button>
+    </div>`;
+  modal(wrap, 'Payment Status');
+  document.getElementById('psToggle').addEventListener('click', ()=>{
+    if (next === 'PAID'){
+      // Ask for the date paid via animated 3D calendar
+      window.openPaidDatePicker(emp, (chosenISO)=>{
+        window.payStatusSet(emp.empId, 'PAID', chosenISO);
+        toast('Marked as PAID', 'ok');
+        closeModal();
+        if (window.__refreshPayroll) window.__refreshPayroll();
+      });
+    } else {
+      window.payStatusSet(emp.empId, next);
+      toast(`Marked as ${next}`, 'ok');
+      closeModal();
+      if (window.__refreshPayroll) window.__refreshPayroll();
+    }
+  });
+};
+
+/* ===== Animated 3D Calendar Date Picker ===== */
+window.openPaidDatePicker = function(emp, onPick){
+  const today = new Date();
+  let cur = new Date(today.getFullYear(), today.getMonth(), 1);
+  let selected = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const wrap = el('div',{class:'cal3d-wrap'});
+  wrap.innerHTML = `
+    <div class="hint" style="text-align:left;color:#bbb;margin-bottom:14px">Select the date payroll was paid for <b style="color:#fff">${emp.name}</b>.</div>
+    <div class="cal3d-stage">
+      <div class="cal3d" id="cal3d">
+        <div class="cal3d-head">
+          <button type="button" class="cal3d-nav" id="calPrev" aria-label="Previous month">‹</button>
+          <div class="cal3d-title" id="calTitle"></div>
+          <button type="button" class="cal3d-nav" id="calNext" aria-label="Next month">›</button>
+        </div>
+        <div class="cal3d-dow"><span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span></div>
+        <div class="cal3d-grid" id="calGrid"></div>
+        <div class="cal3d-foot">
+          <div class="cal3d-sel">Selected: <b id="calSel"></b></div>
+        </div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:18px;gap:10px;flex-wrap:wrap">
+      <button class="gold-btn" id="calConfirm" style="max-width:220px">Confirm Date</button>
+      <button class="ghost-btn" type="button" onclick="closeModal()">Cancel</button>
+    </div>`;
+  modal(wrap, 'Date Paid');
+  function renderCal(dir){
+    const grid = $('calGrid'); const title = $('calTitle');
+    title.textContent = `${months[cur.getMonth()]} ${cur.getFullYear()}`;
+    const first = new Date(cur.getFullYear(), cur.getMonth(), 1).getDay();
+    const dim = new Date(cur.getFullYear(), cur.getMonth()+1, 0).getDate();
+    const cells = [];
+    for (let i=0;i<first;i++) cells.push('<span class="cal3d-cell empty"></span>');
+    for (let d=1; d<=dim; d++){
+      const dt = new Date(cur.getFullYear(), cur.getMonth(), d);
+      const isToday = dt.toDateString() === today.toDateString();
+      const isSel = dt.toDateString() === selected.toDateString();
+      const isFuture = dt > today;
+      cells.push(`<button type="button" class="cal3d-cell${isSel?' sel':''}${isToday?' today':''}${isFuture?' disabled':''}" data-d="${d}"${isFuture?' disabled':''}>${d}</button>`);
+    }
+    grid.innerHTML = cells.join('');
+    grid.style.animation = 'none'; void grid.offsetWidth;
+    grid.style.animation = (dir==='prev'?'cal3dInLeft':'cal3dInRight') + ' .42s var(--ease-s) both';
+    grid.querySelectorAll('.cal3d-cell:not(.empty):not(.disabled)').forEach((b,i)=>{
+      b.style.animation = `cal3dCellIn .35s ${i*0.012}s var(--ease-s) both`;
+      b.addEventListener('click', ()=>{
+        selected = new Date(cur.getFullYear(), cur.getMonth(), Number(b.dataset.d));
+        renderCal();
+      });
+    });
+    $('calSel').textContent = selected.toLocaleDateString('en-GB',{weekday:'short',day:'2-digit',month:'short',year:'numeric'});
+  }
+  $('calPrev').addEventListener('click',()=>{ cur = new Date(cur.getFullYear(), cur.getMonth()-1, 1); renderCal('prev'); });
+  $('calNext').addEventListener('click',()=>{ cur = new Date(cur.getFullYear(), cur.getMonth()+1, 1); renderCal('next'); });
+  $('calConfirm').addEventListener('click',()=>{
+    const iso = new Date(selected.getFullYear(), selected.getMonth(), selected.getDate(), 12, 0, 0).toISOString();
+    if (typeof onPick==='function') onPick(iso);
+  });
+  renderCal();
+};
+
+window.openPayrollInputModal = function(emp, onDone){
+  const pi = piFor(emp.empId);
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div class="hint" style="text-align:left;color:#bbb;margin-bottom:14px">Enter pay-cycle inputs for <b style="color:#fff">${emp.name}</b>.</div>
+    <div class="form-grid cols-2">
+      <div><label>Revenue (USD)</label><input id="piRev" type="number" step="0.01" value="${pi.revenueUSD||0}"/></div>
+      <div><label>Weekly Commissions (PKR)</label><input id="piWk" type="number" step="1" value="${pi.weeklyCommPKR||0}" placeholder="0"/></div>
+    </div>
+    <div class="row" style="margin-top:18px">
+      <button class="gold-btn" id="piSave" style="max-width:200px">Save & Recalculate</button>
+      <button class="ghost-btn" type="button" onclick="closeModal()">Cancel</button>
+    </div>`;
+  modal(wrap, `Payroll Inputs · ${emp.name}`);
+  $('piSave').addEventListener('click', async (ev)=>{
+    await withSpinner(ev.currentTarget, async ()=>{
+      pi.revenueUSD = Number($('piRev').value)||0;
+      pi.weeklyCommPKR = Number($('piWk').value)||0;
+      pi.savedAt = piCycleKey();
+      piSave();
+      toast('Payroll inputs saved','ok');
+      closeModal();
+      if (window.__refreshPayroll) window.__refreshPayroll();
+      if (typeof onDone==='function') setTimeout(onDone, 250);
+    });
+  });
+};
+
+// Payroll override store (per-emp / per-cycle): basic, salesCommPKR, weeklyCommPKR, halfDed, absDed, quotaDed, advanceAmount, otherDeductions, net
+let PAYROLL_OVERRIDES = {};
+try{ PAYROLL_OVERRIDES = JSON.parse(localStorage.getItem('veclar.payrollOverrides')||'{}')||{}; }catch(e){ PAYROLL_OVERRIDES={}; }
+function poKey(empId){ return `${empId}::${piCycleKey()}`; }
+function poGet(empId){ return PAYROLL_OVERRIDES[poKey(empId)] || {}; }
+function poSet(empId, patch){
+  const k = poKey(empId);
+  PAYROLL_OVERRIDES[k] = Object.assign({}, PAYROLL_OVERRIDES[k]||{}, patch);
+  try{ localStorage.setItem('veclar.payrollOverrides', JSON.stringify(PAYROLL_OVERRIDES)); }catch(e){}
+}
+function applyOverrides(emp, p){
+  const o = poGet(emp.empId);
+  const merged = Object.assign({}, p);
+  ['basic','salesCommPKR','weeklyCommPKR','halfDed','absDed','quotaDed','advanceAmount','otherDeductions'].forEach(k=>{
+    if (o[k]!=null) merged[k] = Number(o[k])||0;
+  });
+  // Enforce: if Sales & revenue >= 3500, attendance-based deductions are waived (override-proof)
+  if (isSales(emp) && Number(merged.revenue||0) >= 3500){
+    merged.halfDed = 0; merged.absDed = 0; merged.quotaDed = 0;
+    merged.attendanceWaivedByRevenue = true;
+  }
+  // Recompute net from merged components
+  merged.net = Math.round(
+    (merged.basic||0)
+    - (merged.halfDed||0) - (merged.absDed||0) - (merged.quotaDed||0)
+    + (merged.salesCommPKR||0) + (merged.weeklyCommPKR||0)
+    - (merged.advanceAmount||0) - (merged.otherDeductions||0)
+  );
+  return merged;
+}
+
+window.openPayrollActionsModal = async function(emp){
+  const r = await api('computePayroll',{empId:emp.empId});
+  let p = applyOverrides(emp, r.data);
+  let editing = false;
+
+  function render(){
+    const totalDed = (p.halfDed||0)+(p.absDed||0)+(p.quotaDed||0)+(p.advanceAmount||0)+(p.otherDeductions||0);
+    const isS = isSales(emp);
+    const totalTakeHome = (p.basic||0) + (isS?((p.salesCommPKR||0)+(p.weeklyCommPKR||0)) - (p.halfDed||0) - (p.absDed||0) - (p.quotaDed||0) - (p.otherDeductions||0):0);
+    function row(label, key, value, color){
+      if (editing){
+        return `<div class="kv"><span class="k">${label}</span><span class="v"><input data-pk="${key}" type="number" step="1" value="${Number(value)||0}" style="width:140px;text-align:right;background:#0d0d0e;border:1px solid #333;color:#fff;border-radius:6px;padding:6px 8px"/></span></div>`;
+      }
+      const prefix = color==='ok'?'+':(color==='bad'?'-':'');
+      const style = color==='ok'?'color:var(--ok)':(color==='bad'?'color:#ffb0b1':'');
+      return `<div class="kv"><span class="k">${label}</span><span class="v" style="${style}">${prefix}${fmtMoney(value)}</span></div>`;
+    }
+    const wrap = el('div');
+    wrap.innerHTML = `
+      <div class="hint" style="text-align:left;color:#bbb;margin-bottom:14px">Payroll summary for <b style="color:#fff">${emp.name}</b> · ${emp.dept}<br><span style="color:#888">Period ${fmtDate(p.cycleStart)} – ${fmtDate(p.cycleEnd)}</span>${p.attendanceWaivedByRevenue?'<br><span style="color:var(--ok)">✓ Attendance deductions waived (revenue ≥ $3,500)</span>':''}</div>
+      ${row('Basic','basic',p.basic)}
+      ${isS?`
+        ${editing
+          ? `<div class="kv"><span class="k">Revenue (USD)</span><span class="v"><input data-pk="revenueUSD" type="number" step="0.01" value="${Number(p.revenue)||0}" style="width:140px;text-align:right;background:#0d0d0e;border:1px solid #333;color:#fff;border-radius:6px;padding:6px 8px"/></span></div>`
+          : `<div class="kv"><span class="k">Revenue (USD)</span><span class="v">${fmtUSD(p.revenue)}</span></div>`}
+        ${row('Sales Comm. (PKR)','salesCommPKR',p.salesCommPKR,'ok')}
+        ${row('Weekly Comm. (PKR)','weeklyCommPKR',p.weeklyCommPKR,'ok')}
+      `:''}
+      <div style="margin-top:10px;padding-top:8px;border-top:1px dashed #2a2a30;color:#888;font-size:11px;letter-spacing:.12em;text-transform:uppercase">Deductions</div>
+      ${row('Attendance (Half-day)','halfDed',p.halfDed,'bad')}
+      ${row('Attendance (Absent)','absDed',p.absDed,'bad')}
+      ${row('Excess-leave','quotaDed',p.quotaDed,'bad')}
+      ${row('Advance Amount (PKR)','advanceAmount',p.advanceAmount||0,'bad')}
+      ${row('Other Deductions (PKR)','otherDeductions',p.otherDeductions||0,'bad')}
+      <div class="kv"><span class="k">Total Deductions</span><span class="v" id="liveTotalDed" style="color:#ffb0b1">-${fmtMoney(totalDed)}</span></div>
+      <div class="kv" style="border-top:1px solid var(--gold-dim);margin-top:8px;padding-top:10px"><span class="k" style="color:var(--gold)">NET</span><span class="v" id="liveNet" style="color:var(--gold);font-size:18px">${fmtMoney(p.net)}</span></div>
+      ${isS?`
+           `:''}
+      <div class="row" style="margin-top:20px;gap:10px;flex-wrap:wrap">
+        ${editing
+          ? `<button class="gold-btn" id="paUpdate" style="max-width:200px">Update</button><button class="ghost-btn" id="paCancel">Cancel</button>`
+          : `<button class="ghost-btn" id="paModify">Modify</button><button class="ghost-btn" id="paCalc" style="border-color:rgba(122,183,255,.5);color:var(--info)">Calculate</button><button class="gold-btn" id="paGen" style="max-width:200px">Generate Slip</button>`}
+      </div>`;
+    modal(wrap, `Payroll · ${emp.name}`);
+    if (editing){
+      // ----- Live recompute helpers -----
+      function readVal(key){ const i=document.querySelector(`[data-pk="${key}"]`); return i ? (Number(i.value)||0) : 0; }
+      function setVal(key, v){ const i=document.querySelector(`[data-pk="${key}"]`); if (i) i.value = v; }
+      function liveRecompute(source){
+        if (isS && source==='revenueUSD'){
+          const rev = readVal('revenueUSD');
+          // Apply Sales rules (mirror computePayrollFor):
+          let newBasic = rev >= VECLAR.SALES_REV_BUMP ? VECLAR.SALES_BASE_HIGH : VECLAR.SALES_BASE_LOW;
+          let commUSD = 0;
+          if (rev >= VECLAR.SALES_COMM_T1_FROM){
+            commUSD += Math.max(0, Math.min(rev, VECLAR.SALES_COMM_T2_FROM) - VECLAR.SALES_COMM_T1_FROM) * 0.15;
+          }
+          if (rev >= VECLAR.SALES_COMM_T2_FROM){
+            commUSD += (rev - VECLAR.SALES_COMM_T2_FROM) * 0.20;
+          }
+          const commPKR = Math.round(commUSD * (VECLAR.USD_TO_PKR||0));
+          setVal('basic', newBasic);
+          setVal('salesCommPKR', commPKR);
+          // Waive attendance deductions when revenue ≥ 3500 (sales)
+          if (rev >= 3500){ setVal('halfDed', 0); setVal('absDed', 0); setVal('quotaDed', 0); }
+        }
+        const basic = readVal('basic');
+        const salesC = isS ? readVal('salesCommPKR') : 0;
+        const weeklyC = isS ? readVal('weeklyCommPKR') : 0;
+        let halfD = readVal('halfDed');
+        let absD = readVal('absDed');
+        let quotaD = readVal('quotaDed');
+        const advD = readVal('advanceAmount');
+        const othD = readVal('otherDeductions');
+        // Hard waiver: if sales rev currently ≥ 3500, force zero
+        const curRev = isS ? readVal('revenueUSD') : 0;
+        if (isS && curRev >= 3500){ halfD = 0; absD = 0; quotaD = 0; setVal('halfDed',0); setVal('absDed',0); setVal('quotaDed',0); }
+        const td = halfD + absD + quotaD + advD + othD;
+        const net = Math.round(basic + salesC + weeklyC - td);
+        const take = basic + salesC + weeklyC;
+        const tdEl = document.getElementById('liveTotalDed'); if (tdEl) tdEl.textContent = '-' + fmtMoney(td);
+        const netEl = document.getElementById('liveNet'); if (netEl) netEl.textContent = fmtMoney(net);
+        const bEl = document.getElementById('liveBonus'); if (bEl) bEl.textContent = '+' + fmtMoney(weeklyC);
+        const thEl = document.getElementById('liveTakeHome'); if (thEl) thEl.textContent = fmtMoney(take);
+      }
+      document.querySelectorAll('[data-pk]').forEach(i=>{
+        i.addEventListener('input', ()=>liveRecompute(i.dataset.pk));
+      });
+      $('paUpdate').addEventListener('click',()=>{
+        const inputs = document.querySelectorAll('[data-pk]');
+        const patch = {};
+        inputs.forEach(i=>{ patch[i.dataset.pk] = Number(i.value)||0; });
+        // Persist Revenue (USD) to PAYROLL_INPUTS so backend recompute uses it everywhere.
+        if (patch.revenueUSD != null){
+          const pi = piFor(emp.empId);
+          pi.revenueUSD = Number(patch.revenueUSD)||0;
+          pi.savedAt = piCycleKey();
+          piSave();
+          delete patch.revenueUSD;
+        }
+        // Persist non-revenue overrides per-employee/per-cycle.
+        poSet(emp.empId, patch);
+        // Re-fetch fresh figures (revenue cascades to basic/sales comm) and merge overrides.
+        api('computePayroll',{empId:emp.empId}).then(r2=>{
+          p = applyOverrides(emp, r2.data);
+          editing = false;
+          toast('Payroll updated','ok');
+          render();
+          if (window.__refreshPayroll) window.__refreshPayroll();
+        });
+      });
+      $('paCancel').addEventListener('click',()=>{ editing=false; render(); });
+    } else {
+      $('paModify').addEventListener('click',()=>{ editing=true; render(); });
+      $('paGen').addEventListener('click',()=>generateSalarySlipPDF(emp,p,false));
+      $('paCalc').addEventListener('click', async (ev)=>{
+        await withSpinner(ev.currentTarget, async ()=>{
+          // Preserve revenue + weekly commission, only clear deduction-style overrides
+          // so Sales Commission recomputes from Revenue and Weekly Comm is not zeroed.
+          const pi = piFor(emp.empId);
+          if (pi.revenueUSD == null) pi.revenueUSD = 0;
+          // Carry forward existing weeklyCommPKR from any prior override into pi so it survives the override clear.
+          const prevOverride = PAYROLL_OVERRIDES[poKey(emp.empId)] || {};
+          if (prevOverride.weeklyCommPKR != null) pi.weeklyCommPKR = Number(prevOverride.weeklyCommPKR)||pi.weeklyCommPKR||0;
+          pi.savedAt = piCycleKey(); piSave();
+          // Keep weeklyCommPKR as an override too (so applyOverrides preserves it after recompute).
+          const keepWeekly = (prevOverride.weeklyCommPKR != null) ? {weeklyCommPKR: prevOverride.weeklyCommPKR} : {};
+          PAYROLL_OVERRIDES[poKey(emp.empId)] = keepWeekly;
+          try{ localStorage.setItem('veclar.payrollOverrides', JSON.stringify(PAYROLL_OVERRIDES)); }catch(e){}
+          const r2 = await api('computePayroll',{empId:emp.empId});
+          p = applyOverrides(emp, r2.data);
+          toast('Payroll calculated from Revenue','ok');
+          render();
+          if (window.__refreshPayroll) window.__refreshPayroll();
+        });
+      });
+    }
+  }
+  render();
+};
+
+/* Build a printable salary slip in a hidden iframe and either save or print */
+/* ===== Salary slip templates (Sales = Eman style, Others = Zariya style) ===== */
+function _payPeriodLabel(p){
+  try{ const d = new Date(p.cycleEnd); return d.toLocaleDateString(undefined,{month:'long',year:'numeric'}); }
+
+  catch(e){ return ''; }
+}
+function _slipCommonStyle(){
+  return `
+    @page { size: A4; margin: 0; }
+    html,body{margin:0;padding:0;background:#fff}
+    *{box-sizing:border-box;margin:0;padding:0;font-family:'Helvetica Neue','Inter',Arial,sans-serif;color:#111}
+    .page{width:210mm;height:297mm;padding:12mm 14mm;background:#fff;position:relative;overflow:hidden;page-break-after:auto;page-break-inside:avoid;break-after:auto}
+    .page + .page{page-break-before:always}
+    .vlogo{width:78px;height:auto;margin-bottom:6px}
+    .vbrand{font-weight:800;font-size:20px;letter-spacing:.18em;color:#0b1538}
+    .vbrand small{display:block;font-size:9px;letter-spacing:.32em;color:#0b1538;font-weight:600;margin-top:2px}
+    .topline{border-bottom:2px solid #111;margin-top:8px}
+    .title{font-size:34px;font-weight:800;color:#0b1538;margin:18px 0 14px;letter-spacing:.02em}
+    .meta-row{display:flex;font-size:13.5px;line-height:1.8;color:#111}
+    .meta-row .lbl{width:170px;color:#222}
+    .meta-row .sep{width:18px;color:#222}
+    .sect{background:linear-gradient(180deg,#dff0fb,#cfe1f7);padding:12px 18px;margin-top:12px;border-radius:2px}
+    .sect h3{color:#0b1538;font-size:15px;font-weight:800;margin-bottom:6px}
+    .ln{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;padding:3px 0;color:#111}
+    .ln .l{flex:1}
+    .ln .c{width:18px;text-align:center;color:#222}
+    .ln .v{min-width:130px;text-align:right;font-weight:500}
+    .total{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #6b89c4;margin-top:6px;padding-top:6px;font-weight:800;color:#0b1538;font-size:13.5px}
+    .total.red .v{color:#c0392b}
+    .net{background:linear-gradient(180deg,#dff0fb,#cfe1f7);margin-top:12px;padding:12px 18px;border-radius:2px;display:flex;justify-content:space-between;font-weight:800;color:#0b1538;font-size:15px}
+    .extra{margin-top:8px;padding:10px 18px;border-radius:2px;display:flex;justify-content:space-between;font-weight:700;color:#0b1538;font-size:13px;background:linear-gradient(180deg,#eaf3fb,#dfe9f6)}
+    .extra.gold{background:linear-gradient(180deg,#fff4d6,#ffe7a8);color:#5b4500;font-weight:800}
+    .verify{margin-top:22px;font-size:13px;color:#111}
+    .verify .nm{font-weight:700;margin-top:26px}
+    .sig-faraz{font-family:'Brush Script MT','Lucida Handwriting',cursive;font-size:32px;color:#111;margin-top:6px}
+
+    .empsig{position:absolute;right:14mm;bottom:38mm;width:200px;border-top:1px solid #333;padding-top:6px;text-align:center;font-size:11px;color:#444}
+    .paid-wm{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) rotate(-22deg);text-align:center;pointer-events:none;z-index:5}
+    .paid-wm-text{font-family:'Helvetica Neue',Arial,sans-serif;font-weight:900;font-size:160px;letter-spacing:.08em;color:rgba(46,160,67,.18);border:10px solid rgba(46,160,67,.22);padding:10px 38px;border-radius:14px;line-height:1}
+    .paid-wm-date{margin-top:10px;font-family:'Helvetica Neue',Arial,sans-serif;font-weight:700;font-size:18px;letter-spacing:.18em;color:rgba(46,160,67,.55);text-transform:uppercase}
+    .disclaimer{position:absolute;left:14mm;right:14mm;bottom:16mm;font-size:9.5px;color:#444;line-height:1.5;border-top:1px solid #ddd;padding-top:6px}
+    .footer{position:absolute;left:14mm;right:14mm;bottom:7mm;display:flex;justify-content:space-between;font-size:10px;color:#222}
+    .footer .it{display:flex;gap:6px;align-items:center}
+    .wm{position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);opacity:.06;font-size:300px;font-weight:900;color:#d6a62a;font-family:Arial,sans-serif;pointer-events:none}
+  `;
+}
+function _veclarHeader(){
+  return `
+    <div>
+      <svg class="vlogo" viewBox="0 0 200 260" xmlns="http://www.w3.org/2000/svg">
+        <polygon points="20,30 60,30 100,200 140,30 180,30 120,250 80,250" fill="#d6a62a"/>
+      </svg>
+      <div class="vbrand">  VECLAR<small>— TECHNOLOGIES —</small></div>
+      <div class="topline"></div>
+    </div>`;
+}
+function _veclarFooter(){
+  return `
+    <div class="disclaimer">This salary slip is a confidential document generated by Veclar HRMS for the exclusive use of the employee. Any unauthorized alteration, tampering, or modification of the data, dates, or figures contained within is strictly prohibited by company policy and may lead to disciplinary or legal action. Should you find any discrepancies, please contact the HR Department immediately for verification.</div>
+    <div class="footer">
+      <div class="it">📞 +92 332-5755577</div>
+      <div class="it">✉ hr@veclartechnologies.com</div>
+      <div class="it">🌐 www.veclartechnologies.com</div>
+    </div>`;
+}
+
+function buildSalarySlipPage(emp,p){
+  const isS = isSales(emp);
+  const period = _payPeriodLabel(p);
+  const totalEarnings = (p.basic||0) + (isS?(p.salesCommPKR||0)+(p.weeklyCommPKR||0):0);
+  const totalDed = (p.halfDed||0)+(p.absDed||0)+(p.quotaDed||0)+(p.advanceAmount||0)+(p.otherDeductions||0);
+  const attendanceDed = (p.halfDed||0)+(p.absDed||0)+(p.quotaDed||0);
+
+  const earningsRows = isS ? `
+    <div class="ln"><div class="l">Basic Salary</div><div class="c">:</div><div class="v">PKR ${Number(p.basic||0).toLocaleString('en-US')}/-</div></div>
+    <div class="ln"><div class="l">Commissions</div><div class="c">:</div><div class="v">PKR ${Number(p.salesCommPKR||0).toLocaleString('en-US')}/-</div></div>
+    <div class="ln"><div class="l">Daily & Weekly Bonuses</div><div class="c">:</div><div class="v">PKR ${Number(p.weeklyCommPKR||0).toLocaleString('en-US')}/-</div></div>
+   <div class="ln"><div class="l">Other Incentives</div><div class="c">:</div><div class="v">PKR 0/-</div></div>
+    <div class="total"><div class="l">Total Earnings</div><div class="v">PKR ${Number(totalEarnings).toLocaleString('en-US')}/-</div></div>
+  ` : `
+    <div class="ln"><div class="l">Basic Salary</div><div class="c">:</div><div class="v">PKR ${Number(p.basic||0).toLocaleString('en-US')}/-</div></div>
+      <div class="ln"><div class="l">Bonuses</div><div class="c">:</div><div class="v">PKR 0/-</div></div>
+    <div class="ln"><div class="l">Other Incentives</div><div class="c">:</div><div class="v">PKR 0/-</div></div>
+    <div class="total"><div class="l">Total Earnings</div><div class="v">PKR ${Number(totalEarnings).toLocaleString('en-US')}/-</div></div>
+  `;
+
+  const deductionsRows = isS ? `
+    <div class="ln"><div class="l">Attendance</div><div class="c">:</div><div class="v">PKR ${Number(attendanceDed).toLocaleString('en-US')}/-</div></div>
+    <div class="ln"><div class="l">DOC</div><div class="c">:</div><div class="v">PKR 0/-</div></div>
+    <div class="ln"><div class="l">Advance Amount</div><div class="c">:</div><div class="v">PKR ${Number(p.advanceAmount||0).toLocaleString('en-US')}/-</div></div>
+    <div class="ln"><div class="l">Other Deductions</div><div class="c">:</div><div class="v">PKR ${Number(p.otherDeductions||0).toLocaleString('en-US')}/-</div></div>
+    <div class="total red"><div class="l">Total Deductions</div><div class="v">PKR ${Number(totalDed).toLocaleString('en-US')}/-</div></div>
+  ` : `
+    <div class="ln"><div class="l">Attendance</div><div class="c">:</div><div class="v">PKR ${Number(attendanceDed).toLocaleString('en-US')}/-</div></div>
+    <div class="ln"><div class="l">Advance Amount</div><div class="c">:</div><div class="v">PKR ${Number(p.advanceAmount||0).toLocaleString('en-US')}/-</div></div>
+    <div class="ln"><div class="l">Other Deductions</div><div class="c">:</div><div class="v">PKR ${Number(p.otherDeductions||0).toLocaleString('en-US')}/-</div></div>
+    <div class="total red"><div class="l">Total Deductions</div><div class="v">PKR ${Number(totalDed).toLocaleString('en-US')}/-</div></div>
+  `;
+
+  const psRec = (typeof window!=='undefined' && window.payStatusGet) ? window.payStatusGet(emp.empId) : null;
+  const isPaid = psRec && psRec.status === 'PAID';
+  const paidDateStr = isPaid && psRec.paidAt
+    ? new Date(psRec.paidAt).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})
+    : '';
+
+  return `
+    <div class="page">
+      <div class="wm">V</div>
+      ${isPaid?`<div class="paid-wm"><div class="paid-wm-text">PAID</div><div class="paid-wm-date">${paidDateStr}</div></div>`:''}
+      ${_veclarHeader()}
+      <div class="title">EMPLOYEE PAYSLIP</div>
+      <div class="meta-row"><div class="lbl">Pay Period</div><div class="sep">:</div><div>${period}</div></div>
+      <div class="meta-row"><div class="lbl">Employee ID</div><div class="sep">:</div><div>${emp.empId||''}</div></div>
+      <div class="meta-row"><div class="lbl">Employee Name</div><div class="sep">:</div><div>${emp.name||''}</div></div>
+      <div class="meta-row"><div class="lbl">Designation</div><div class="sep">:</div><div>${emp.title||emp.dept||''}</div></div>
+      <div class="meta-row"><div class="lbl">Working Days</div><div class="sep">:</div><div>${p.workingDays||0}</div></div>
+
+      <div class="sect"><h3>Earnings</h3>${earningsRows}</div>
+      <div class="sect"><h3>Deductions</h3>${deductionsRows}</div>
+      <div class="net"><div>${isS?'Net Salary':'Net Payable Salary'}</div><div>PKR ${Number(p.net||0).toLocaleString('en-US')}/-</div></div>
+      ${isS?`
+                <div class="extra gold"><div>Total Take Home Salary</div><div>PKR ${Number(totalEarnings).toLocaleString('en-US')}/-</div></div>
+      `:''}
+
+      <div class="verify">
+        Verified By:
+        <div class="sig-faraz">Faraz</div>
+        <div class="nm">Faraz Shahzad</div>
+        <div>Human Resource Manager</div>
+      </div>
+      <div class="empsig">Employee Signature</div>
+      ${_veclarFooter()}
+    </div>`;
+}
+
+function buildSalarySlipHTML(emp,p){
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Salary Slip · ${emp.name}</title>
+    <style>${_slipCommonStyle()}</style></head><body>${buildSalarySlipPage(emp,p)}</body></html>`;
+}
+function buildMultiSlipHTML(items){
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Veclar Payroll Slips</title>
+    <style>${_slipCommonStyle()}</style></head><body>${items.map(({emp,p})=>buildSalarySlipPage(emp,p)).join('')}</body></html>`;
+}
+
+/* Render slip HTML in a hidden iframe and trigger the browser print dialog
+   (user picks "Save as PDF"). Avoids html2canvas blank-page issues. */
+function _printHTMLViaIframe(html, title){
+  const old = document.getElementById('slipFrame'); if (old) old.remove();
+  const ifr = document.createElement('iframe');
+  ifr.id = 'slipFrame';
+  ifr.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;pointer-events:none';
+  document.body.appendChild(ifr);
+  ifr.onload = ()=>{
+    try{
+      try{ ifr.contentDocument.title = title || 'Veclar Payroll'; }catch(e){}
+      const w = ifr.contentWindow;
+      setTimeout(()=>{ try{ w.focus(); w.print(); }catch(e){ console.error(e); toast('Print failed','bad'); } }, 300);
+    }catch(e){ console.error(e); toast('Failed to render','bad'); }
+  };
+  ifr.srcdoc = html;
+}
+
+function generateSalarySlipPDF(emp,p,printOnly){
+  const html = buildSalarySlipHTML(emp,p);
+  toast(printOnly?'Sending to printer…':'Use the print dialog to Save as PDF','ok');
+  _printHTMLViaIframe(html, `Salary Slip - ${emp.name} - ${piCycleKey()}`);
+}
+
+async function runFullPayrollAndPrint(){
+  toast('Computing payroll for all employees…','ok');
+  const emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old');
+  const items = [];
+  for (const emp of emps){
+    const r = await api('computePayroll',{empId:emp.empId});
+    items.push({emp, p: applyOverrides(emp, r.data)});
+  }
+  if (!items.length){ toast('No employees to process','bad'); return; }
+  const html = buildMultiSlipHTML(items);
+  _printHTMLViaIframe(html, `Veclar Payroll - ${piCycleKey()}`);
+  toast('Use the print dialog to Save as PDF','ok');
+}
+window.runFullPayrollAndPrint = runFullPayrollAndPrint;
+
+/* ---- Admin: Reports / Settings ---- */
+
+RENDERERS.reports = async function(){
+  const v = $('view-reports'); v.innerHTML='';
+  v.innerHTML = `<div class="hero"><div><h1>Reports <b>& Analytics</b></h1><div class="sub">Headcount and attendance insights</div></div></div>`;
+
+  // Headcount panel (existing)
+  const emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old');
+  const counts = VECLAR.DEPARTMENTS.map(d=>({d, n:emps.filter(e=>e.dept===d).length}));
+  const max = Math.max(1, ...counts.map(c=>c.n));
+  const p0 = el('div',{class:'panel'});
+  p0.innerHTML = `<h3><span class="accent"></span>Headcount by Department</h3>`;
+  counts.forEach(c=>{
+    const row = el('div',{class:'bar-row'});
+    row.innerHTML = `<span class="lbl">${c.d}</span><div class="bar"><span style="width:${c.n/max*100}%"></span></div><span class="num">${c.n}</span>`;
+    p0.appendChild(row);
+  });
+  v.appendChild(p0);
+
+  // === Carousel of report cards ===
+  const repPanel = el('div',{class:'panel'});
+  repPanel.innerHTML = `<h3><span class="accent"></span>Generate Reports <span class="actions"><span class="pill">Hover to flip</span></span></h3>`;
+  const track = el('div',{class:'rep-track', id:'repTrack'});
+
+  const cards = [
+    {key:'payroll', title:'Payroll', desc:'Comprehensive payroll analytics, deductions, commissions and net payouts.', icon:'<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M2 10h20M2 14h20"/>', flip:true},
+    {key:'attendance', title:'Attendance', desc:'Punctuality, absence and shift adherence trends.', icon:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', coming:true},
+    {key:'leaves', title:'Leaves', desc:'Approved, rejected and pending leave breakdowns.', icon:'<path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19.5 2c.5 6.83-1.71 13.74-9 18z"/><path d="M2 21c0-3 1.85-5.36 5.08-6"/>', coming:true},
+    
+    {key:'headcount', title:'Headcount', desc:'Department, role and tenure distribution.', icon:'<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>', coming:true},
+  ];
+
+  cards.forEach(cd=>{
+    const card = el('div',{class:'rep-card' + (cd.flip?' flippable':'') + (cd.coming?' coming':'')});
+    card.innerHTML = `
+      <div class="rep-inner">
+        <div class="rep-face">
+          <div class="rep-icon"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${cd.icon}</svg></div>
+          <h4>${cd.title}</h4>
+          <p>${cd.desc}</p>
+        </div>
+        ${cd.flip?`
+          <div class="rep-face rep-back">
+            <h5>Choose Period</h5>
+            <button type="button" class="rep-opt" data-act="current">Current Month</button>
+            <div class="rep-prev">
+              <button type="button" class="rep-opt" data-act="prev">Previous Month</button>
+              <div class="rep-prev-pick" style="display:none;flex-direction:column;gap:8px;margin-top:6px">
+                <select class="rep-year"></select>
+                <select class="rep-month"></select>
+                <button type="button" class="rep-opt rep-go" style="background:linear-gradient(135deg,var(--gold),var(--gold-soft));color:#000;border-color:var(--gold)">Generate</button>
+              </div>
+            </div>
+          </div>
+        `:''}
+      </div>`;
+    if (cd.flip){
+      const yearSel = card.querySelector('.rep-year');
+      const monthSel = card.querySelector('.rep-month');
+      const ny = new Date().getFullYear();
+      for (let y=ny; y>=ny-4; y--) yearSel.insertAdjacentHTML('beforeend',`<option value="${y}">${y}</option>`);
+      const mn = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+      mn.forEach((m,i)=>monthSel.insertAdjacentHTML('beforeend',`<option value="${i}">${m}</option>`));
+      const cd0 = new Date(); monthSel.value = String(Math.max(0, cd0.getMonth()-1));
+      const pickWrap = card.querySelector('.rep-prev-pick');
+      card.querySelector('[data-act="current"]').addEventListener('click',(ev)=>{
+        ev.stopPropagation();
+        const d = new Date();
+        generatePayrollReport(d.getFullYear(), d.getMonth());
+      });
+      card.querySelector('[data-act="prev"]').addEventListener('click',(ev)=>{
+        ev.stopPropagation();
+        pickWrap.style.display = pickWrap.style.display==='flex'?'none':'flex';
+      });
+      card.querySelector('.rep-go').addEventListener('click',(ev)=>{
+        ev.stopPropagation();
+        generatePayrollReport(Number(yearSel.value), Number(monthSel.value));
+      });
+    }
+    track.appendChild(card);
+  });
+  repPanel.appendChild(track);
+  v.appendChild(repPanel);
+
+  // gentle auto-scroll loop
+  let dir = 1;
+  const auto = setInterval(()=>{
+    if (!document.body.contains(track)) { clearInterval(auto); return; }
+    if (track.matches(':hover')) return;
+    const max = track.scrollWidth - track.clientWidth;
+    if (max<=0) return;
+    track.scrollLeft += dir * 1.2;
+    if (track.scrollLeft >= max-1) dir = -1;
+    else if (track.scrollLeft <= 0) dir = 1;
+  }, 30);
+};
+
+/* ===== Payroll Report PDF Generator ===== */
+async function generatePayrollReport(year, monthIdx){
+  toast('Building payroll report…','ok');
+  const cycleKey = `${year}-${String(monthIdx+1).padStart(2,'0')}`;
+  const monthName = ['January','February','March','April','May','June','July','August','September','October','November','December'][monthIdx];
+  const emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old');
+  const rows = [];
+  for (const emp of emps){
+    const r = await api('computePayroll',{empId:emp.empId, cycleKey});
+    if (r.ok) rows.push({emp, p: applyOverrides(emp, r.data)});
+  }
+  // Aggregate stats
+  const totals = rows.reduce((acc,{p})=>{
+    acc.basic += p.basic||0;
+    acc.salesComm += p.salesCommPKR||0;
+    acc.weekComm += p.weeklyCommPKR||0;
+    acc.halfDed += p.halfDed||0; acc.absDed += p.absDed||0; acc.quotaDed += p.quotaDed||0;
+    acc.adv += p.advanceAmount||0; acc.other += p.otherDeductions||0;
+    acc.net += p.net||0;
+    return acc;
+  },{basic:0,salesComm:0,weekComm:0,halfDed:0,absDed:0,quotaDed:0,adv:0,other:0,net:0});
+  const totalDed = totals.halfDed+totals.absDed+totals.quotaDed+totals.adv+totals.other;
+  const totalEarn = totals.basic+totals.salesComm+totals.weekComm;
+  const headcount = rows.length;
+  const avgNet = headcount? Math.round(totals.net/headcount) : 0;
+  // Department breakdown
+  const byDept = {};
+  rows.forEach(({emp,p})=>{ if(!byDept[emp.dept]) byDept[emp.dept]={n:0,net:0}; byDept[emp.dept].n++; byDept[emp.dept].net+=p.net||0; });
+  const deptArr = Object.entries(byDept).map(([d,v])=>({d, n:v.n, net:v.net})).sort((a,b)=>b.net-a.net);
+  // Paid vs Unpaid
+  let paidN=0, unpaidN=0, paidAmt=0, unpaidAmt=0;
+  rows.forEach(({emp,p})=>{
+    const rec = window.payStatusGet ? window.payStatusGet(emp.empId) : null;
+    const st = rec? rec.status : 'PAID';
+    if (st==='PAID'){ paidN++; paidAmt += p.net||0; } else { unpaidN++; unpaidAmt += p.net||0; }
+  });
+  // Top 5 earners
+  const top5 = rows.slice().sort((a,b)=>(b.p.net||0)-(a.p.net||0)).slice(0,5);
+
+  // ==== SVG charts (no external libs) ====
+  const fmt = n => 'PKR ' + Number(Math.round(n||0)).toLocaleString('en-US');
+  function svgBarChart(items, w=520, h=200, color='#d6a62a'){
+    if (!items.length) return '';
+    const max = Math.max(1, ...items.map(i=>i.v));
+    const pad={l:40,r:10,t:14,b:38};
+    const cw = w-pad.l-pad.r, ch = h-pad.t-pad.b;
+    const bw = cw/items.length * .65;
+    const gap = cw/items.length * .35;
+    let bars='', labels='', grid='';
+    for (let g=0;g<=4;g++){
+      const y = pad.t + ch*(g/4);
+      grid += `<line x1="${pad.l}" y1="${y}" x2="${w-pad.r}" y2="${y}" stroke="#e8eaf0" stroke-width="1"/>`;
+      grid += `<text x="${pad.l-6}" y="${y+3}" font-size="9" fill="#888" text-anchor="end">${Math.round(max*(1-g/4)/1000)}k</text>`;
+    }
+    items.forEach((it,i)=>{
+      const bh = (it.v/max)*ch;
+      const x = pad.l + i*(bw+gap) + gap/2;
+      const y = pad.t + ch - bh;
+      bars += `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${color}" rx="3"><title>${it.l}: ${fmt(it.v)}</title></rect>`;
+      bars += `<text x="${x+bw/2}" y="${y-3}" font-size="9" fill="#333" text-anchor="middle" font-weight="600">${Math.round(it.v/1000)}k</text>`;
+      labels += `<text x="${x+bw/2}" y="${h-pad.b+14}" font-size="10" fill="#444" text-anchor="middle">${it.l.length>10?it.l.slice(0,10)+'…':it.l}</text>`;
+    });
+    return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" xmlns="http://www.w3.org/2000/svg">${grid}${bars}${labels}</svg>`;
+  }
+  function svgPie(parts, size=180){
+    const tot = parts.reduce((s,p)=>s+p.v,0)||1;
+    const cx=size/2, cy=size/2, r=size/2-8;
+    let acc=0, paths='', legend='';
+    parts.forEach((p,i)=>{
+      const start = acc/tot*Math.PI*2 - Math.PI/2;
+      acc += p.v;
+      const end = acc/tot*Math.PI*2 - Math.PI/2;
+      const large = (end-start) > Math.PI ? 1 : 0;
+      const x1=cx+r*Math.cos(start), y1=cy+r*Math.sin(start);
+      const x2=cx+r*Math.cos(end),   y2=cy+r*Math.sin(end);
+      paths += `<path d="M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large} 1 ${x2},${y2} Z" fill="${p.c}" stroke="#fff" stroke-width="2"/>`;
+      legend += `<div style="display:flex;align-items:center;gap:6px;font-size:11px;margin:3px 0"><span style="width:10px;height:10px;background:${p.c};border-radius:2px;display:inline-block"></span>${p.l}: <b>${p.v}</b> (${Math.round(p.v/tot*100)}%)</div>`;
+    });
+    return `<div style="display:flex;align-items:center;gap:14px"><svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">${paths}</svg><div>${legend}</div></div>`;
+  }
+  function svgCompareBars(groups, w=520, h=180){
+    // groups = [{label, a, b}], a=earnings, b=deductions
+    if (!groups.length) return '';
+    const max = Math.max(1, ...groups.flatMap(g=>[g.a,g.b]));
+    const pad={l:40,r:10,t:14,b:38};
+    const cw=w-pad.l-pad.r, ch=h-pad.t-pad.b;
+    const slot = cw/groups.length;
+    const bw = slot*.32;
+    let out='', labels='', grid='';
+    for (let g=0;g<=4;g++){
+      const y=pad.t+ch*(g/4);
+      grid+=`<line x1="${pad.l}" y1="${y}" x2="${w-pad.r}" y2="${y}" stroke="#e8eaf0"/>`;
+      grid+=`<text x="${pad.l-6}" y="${y+3}" font-size="9" fill="#888" text-anchor="end">${Math.round(max*(1-g/4)/1000)}k</text>`;
+    }
+    groups.forEach((g,i)=>{
+      const x=pad.l + i*slot + slot*.1;
+      const ah=(g.a/max)*ch, bh=(g.b/max)*ch;
+      const ay=pad.t+ch-ah, by=pad.t+ch-bh;
+      out+=`<rect x="${x}" y="${ay}" width="${bw}" height="${ah}" fill="#2ea043" rx="2"/>`;
+      out+=`<rect x="${x+bw+4}" y="${by}" width="${bw}" height="${bh}" fill="#c0392b" rx="2"/>`;
+      labels+=`<text x="${x+bw+2}" y="${h-pad.b+14}" font-size="10" fill="#444" text-anchor="middle">${g.label.length>10?g.label.slice(0,10)+'…':g.label}</text>`;
+    });
+    out += `<g transform="translate(${pad.l},6)"><rect width="10" height="10" fill="#2ea043"/><text x="14" y="9" font-size="10" fill="#333">Earnings</text><rect x="80" width="10" height="10" fill="#c0392b"/><text x="94" y="9" font-size="10" fill="#333">Deductions</text></g>`;
+    return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" xmlns="http://www.w3.org/2000/svg">${grid}${out}${labels}</svg>`;
+  }
+
+  // Department earnings vs deductions data
+  const cmpGroups = deptArr.map(d=>{
+    const r = rows.filter(x=>x.emp.dept===d.d);
+    const a = r.reduce((s,{p})=>s+(p.basic||0)+(p.salesCommPKR||0)+(p.weeklyCommPKR||0),0);
+    const b = r.reduce((s,{p})=>s+(p.halfDed||0)+(p.absDed||0)+(p.quotaDed||0)+(p.advanceAmount||0)+(p.otherDeductions||0),0);
+    return {label:d.d, a, b};
+  });
+
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Payroll Report · ${monthName} ${year}</title>
+<style>
+  @page { size: A4; margin: 0; }
+  *{box-sizing:border-box;margin:0;padding:0;font-family:'Helvetica Neue','Inter',Arial,sans-serif;color:#111}
+  body{background:#fff}
+  .page{width:210mm;min-height:297mm;padding:10mm 12mm;background:#fff;position:relative}
+  .hd{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid #d6a62a;padding-bottom:8px;margin-bottom:10px}
+  .hd .brand{font-family:'Montserrat',Arial,sans-serif;font-weight:800;font-size:22px;letter-spacing:.2em;color:#0b1538}
+  .hd .brand small{display:block;font-size:8px;letter-spacing:.32em;color:#0b1538;font-weight:600;margin-top:2px}
+  .hd .meta{text-align:right;font-size:11px;color:#444}
+  .hd .meta b{font-size:14px;color:#0b1538;display:block}
+  h2{font-family:'Montserrat',Arial,sans-serif;font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#0b1538;margin:10px 0 6px;border-left:4px solid #d6a62a;padding-left:8px}
+  .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:6px}
+  .kpi{padding:9px 11px;border-radius:8px;background:linear-gradient(160deg,#eef3fb,#dde8f5);border:1px solid #cdd9ec}
+  .kpi .l{font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:#456;font-weight:700}
+  .kpi .v{font-family:'Montserrat',Arial;font-weight:800;color:#0b1538;font-size:14px;margin-top:3px}
+  .kpi .s{font-size:9px;color:#789;margin-top:2px}
+  .kpi.gold{background:linear-gradient(160deg,#fff4d6,#ffe7a8);border-color:#e6c160}
+  .kpi.gold .v{color:#5b4500}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .grid32{display:grid;grid-template-columns:1.3fr 1fr;gap:10px}
+  .panel{border:1px solid #d8dde7;border-radius:8px;padding:8px 10px;background:#fafbfd}
+  .panel h3{font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#0b1538;margin-bottom:4px}
+  table{width:100%;border-collapse:collapse;font-size:10px;margin-top:4px}
+  th{background:#0b1538;color:#fff;padding:5px 6px;text-align:left;font-size:9px;letter-spacing:.08em;text-transform:uppercase}
+  td{padding:4px 6px;border-bottom:1px solid #eef0f5}
+  td.r,th.r{text-align:right}
+  .ana{font-size:10.5px;line-height:1.55;color:#222}
+  .ana b{color:#0b1538}
+  .footer{position:absolute;left:12mm;right:12mm;bottom:6mm;display:flex;justify-content:space-between;font-size:9px;color:#666;border-top:1px solid #ddd;padding-top:5px}
+  .pill{display:inline-block;font-size:9px;padding:2px 7px;border-radius:99px;background:#e7f0ff;color:#234}
+</style></head>
+<body><div class="page">
+  <div class="hd">
+    <div>
+      <div class="brand">VECLAR<small>— TECHNOLOGIES —</small></div>
+      <div style="font-size:11px;color:#666;margin-top:4px">Payroll Analytics Report</div>
+    </div>
+    <div class="meta">
+      <b>${monthName} ${year}</b>
+      Generated ${new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})}
+      <div class="pill" style="margin-top:4px">Cycle ${cycleKey}</div>
+    </div>
+  </div>
+
+  <h2>Executive Summary</h2>
+  <div class="kpi-row">
+    <div class="kpi"><div class="l">Headcount</div><div class="v">${headcount}</div><div class="s">Active employees</div></div>
+    <div class="kpi"><div class="l">Total Earnings</div><div class="v">${fmt(totalEarn)}</div><div class="s">Basic + Commissions</div></div>
+    <div class="kpi"><div class="l">Total Deductions</div><div class="v" style="color:#a01818">${fmt(totalDed)}</div><div class="s">All categories</div></div>
+    <div class="kpi gold"><div class="l">Net Payout</div><div class="v">${fmt(totals.net)}</div><div class="s">Avg ${fmt(avgNet)}/emp</div></div>
+  </div>
+
+  <div class="grid32" style="margin-top:8px">
+    <div class="panel">
+      <h3>Net Payout by Department</h3>
+      ${svgBarChart(deptArr.map(d=>({l:d.d, v:d.net})), 520, 180)}
+    </div>
+    <div class="panel">
+      <h3>Payment Status</h3>
+      ${svgPie([{l:'Paid', v:paidN, c:'#2ea043'},{l:'Unpaid', v:unpaidN, c:'#f5c451'}], 150)}
+      <div style="margin-top:6px;font-size:10px;color:#444"><b>${fmt(paidAmt)}</b> paid · <b style="color:#a06800">${fmt(unpaidAmt)}</b> pending</div>
+    </div>
+  </div>
+
+  <h2>Earnings vs Deductions by Department</h2>
+  <div class="panel">
+    ${svgCompareBars(cmpGroups, 720, 170)}
+  </div>
+
+  <div class="grid2" style="margin-top:8px">
+    <div class="panel">
+      <h3>Cost Breakdown</h3>
+      <table>
+        <thead><tr><th>Component</th><th class="r">Amount</th><th class="r">Share</th></tr></thead>
+        <tbody>
+          ${[
+            ['Basic Salaries', totals.basic, '#0b1538'],
+            ['Sales Commissions', totals.salesComm, '#0b1538'],
+            ['Weekly Bonuses', totals.weekComm, '#0b1538'],
+            ['Half-day Deductions', totals.halfDed, '#a01818'],
+            ['Absent Deductions', totals.absDed, '#a01818'],
+            ['Excess Leave', totals.quotaDed, '#a01818'],
+            ['Advance Recovery', totals.adv, '#a01818'],
+            ['Other Deductions', totals.other, '#a01818'],
+          ].map(([l,v,c])=>`<tr><td>${l}</td><td class="r" style="color:${c}">${fmt(v)}</td><td class="r">${totalEarn+totalDed?Math.round(v/(totalEarn+totalDed)*100):0}%</td></tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Top 5 Net Earners</h3>
+      <table>
+        <thead><tr><th>#</th><th>Employee</th><th>Dept</th><th class="r">Net</th></tr></thead>
+        <tbody>
+          ${top5.map((x,i)=>`<tr><td>${i+1}</td><td>${x.emp.name}</td><td>${x.emp.dept}</td><td class="r"><b>${fmt(x.p.net)}</b></td></tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:#888">No data</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>Analysis</h2>
+  <div class="panel ana">
+    The payroll cycle for <b>${monthName} ${year}</b> covers <b>${headcount}</b> active employees across <b>${deptArr.length}</b> departments,
+    with a total earnings outlay of <b>${fmt(totalEarn)}</b> and deductions of <b>${fmt(totalDed)}</b>, yielding a net payout of <b>${fmt(totals.net)}</b>.
+    ${deptArr[0]?`The <b>${deptArr[0].d}</b> department is the largest cost center this cycle at <b>${fmt(deptArr[0].net)}</b> (${Math.round(deptArr[0].net/(totals.net||1)*100)}% of net payout).`:''}
+    Sales commissions contributed <b>${fmt(totals.salesComm)}</b>, reflecting revenue performance under the tiered commission scheme.
+    ${unpaidN>0?`<b>${unpaidN}</b> payslip${unpaidN>1?'s remain':' remains'} unpaid (totalling <b>${fmt(unpaidAmt)}</b>) and require disbursement.`:'All payslips for this cycle have been marked as paid.'}
+    Average net per employee stands at <b>${fmt(avgNet)}</b>.
+  </div>
+
+  <div class="footer">
+    <div>Veclar HRMS · Confidential · For internal use only</div>
+    <div>Page 1 of 1</div>
+  </div>
+</div></body></html>`;
+
+  _printHTMLViaIframe(html, `Veclar Payroll Report - ${monthName} ${year}`);
+  toast('Use the print dialog to Save as PDF','ok');
+}
+window.generatePayrollReport = generatePayrollReport;
+
+
+RENDERERS.settings = function(){
+  const v = $('view-settings'); v.innerHTML='';
+  v.innerHTML = `<div class="hero"><div><h1>Settings</h1><div class="sub">Office hours, holidays and integrations</div></div></div>`;
+  const p = el('div',{class:'panel'});
+  p.innerHTML = `<h3><span class="accent"></span>Attendance Rules</h3>
+    <div class="form-grid cols-2">
+      <div><label>Shift</label><input value="${VECLAR.SHIFT.start} – ${VECLAR.SHIFT.end}" disabled/></div>
+      <div><label>Working Days</label><input value="Mon–Fri (Sat & Sun OFF)" disabled/></div>
+      <div><label>Present until</label><input value="${VECLAR.PRESENT_UNTIL}" disabled/></div>
+      <div><label>Late until</label><input value="${VECLAR.LATE_UNTIL}" disabled/></div>
+      <div><label>Half-Day after</label><input value="${VECLAR.LATE_UNTIL}" disabled/></div>
+      <div><label>Monthly Leave Quota</label><input value="${VECLAR.MONTHLY_LEAVE_QUOTA}" disabled/></div>
+    </div>`;
+  v.appendChild(p);
+
+  const sp = el('div',{class:'panel'});
+  sp.innerHTML = `<h3><span class="accent"></span>Sales Compensation Rules</h3>
+    <div class="kv"><span class="k">Min basic salary</span><span class="v">${fmtMoney(VECLAR.MIN_BASIC_SALARY)}</span></div>
+    <div class="kv"><span class="k">Revenue ≥ $${VECLAR.SALES_REV_BUMP}</span><span class="v">Base bumps to ${fmtMoney(VECLAR.SALES_BASE_HIGH)}</span></div>
+    <div class="kv"><span class="k">$${VECLAR.SALES_COMM_T1_FROM}–$${VECLAR.SALES_COMM_T2_FROM-1}</span><span class="v">15% commission (USD)</span></div>
+    <div class="kv"><span class="k">≥ $${VECLAR.SALES_COMM_T2_FROM}</span><span class="v">20% commission on portion above (USD)</span></div>
+    <div class="kv"><span class="k">Sales Lead/Head</span><span class="v">Basic + team commissions</span></div>`;
+  v.appendChild(sp);
+
+  // Currency settings
+  const cp = el('div',{class:'panel'});
+  cp.innerHTML = `<h3><span class="accent"></span>Currency Conversion</h3>
+    <div class="form-grid cols-2">
+      <div><label>USD → PKR Rate (used to convert regular sales commission to PKR)</label>
+        <input id="setUsdRate" type="number" step="0.01" value="${VECLAR.USD_TO_PKR}"/></div>
+      <div style="display:flex;align-items:end"><button class="gold-btn" id="saveUsdRate" style="max-width:180px">Save Rate</button></div>
+    </div>
+    <div class="hint" style="text-align:left;color:#888;margin-top:8px;font-size:11px">Applied at payroll generation time. Weekly Commissions are entered directly in PKR and not converted.</div>`;
+  v.appendChild(cp);
+  $('saveUsdRate').addEventListener('click', ()=>{
+    const r = Number($('setUsdRate').value)||0;
+    if (r<=0){ toast('Enter a valid rate','bad'); return; }
+    VECLAR.USD_TO_PKR = r;
+    try{ localStorage.setItem('veclar.usdRate', String(r)); }catch(e){}
+    toast(`USD rate set to ${r}`,'ok');
+  });
+};
+
+/* =====================================================================
+ * BOOT FLOW (doors slam → neon V (2s) → login → validate → app)
+ * ===================================================================== */
+(function(){
+  const stage = $('stage'), app=$('app'), login=$('loginScreen'), validate=$('validate'), vStatus=$('vStatus'), impact=$('impact'), form=$('loginForm'), err=$('err'), signin=$('signin');
+  const halves = document.querySelectorAll('.logo-half');
+
+  function closeDoorsSlam(){
+    return new Promise(res=>{
+      stage.classList.remove('doors-open','neon');
+      requestAnimationFrame(()=>{
+        stage.classList.add('doors-closed');
+        // doors transition is .95s — flash neon at impact (~950ms)
+        setTimeout(()=>{
+          impact.classList.add('flash');
+          stage.classList.add('neon');
+          setTimeout(()=>impact.classList.remove('flash'), 700);
+          res();
+        }, 950);
+      });
+    });
+  }
+  function holdNeonAndShowLogin(){
+    return new Promise(res=>{
+      // Hold full neon V for 2 seconds
+      setTimeout(()=>{
+        // fade halves out, reveal login
+        halves.forEach(h=>h.classList.add('fading'));
+        setTimeout(()=>{
+          login.classList.remove('hide');
+          login.setAttribute('aria-hidden','false');
+          login.classList.add('show');
+          res();
+        }, 450);
+      }, 2000);
+    });
+  }
+  function runValidation(success){
+    return new Promise(res=>{
+      validate.classList.remove('hide','fail');
+      validate.style.display='flex';
+      validate.classList.add('show');
+      vStatus.innerHTML='Verifying credentials…';
+      setTimeout(()=>{
+        if (success){
+          vStatus.innerHTML='<span class="ok">✓ Authentication Verified</span>';
+          login.classList.remove('show'); login.style.display='none';
+          // Fade ONLY the "Authentication Verified" text — keep the V visible so it
+          // can merge into the door-V that splits open on the next screen.
+          setTimeout(()=>{ vStatus.classList.add('fading'); }, 600);
+          setTimeout(()=>{
+            // Hide the validate overlay silently (no fadeOut on V); the identical
+            // door logo-V underneath stays in place, ready to split with the doors.
+            validate.classList.remove('show');
+            validate.style.display='none';
+            vStatus.classList.remove('fading');
+            vStatus.innerHTML='Verifying credentials…';
+            res(true);
+          }, 1100);
+        } else {
+          validate.classList.add('fail');
+          vStatus.innerHTML='<span style="color:#ff8e8e">✕ Verification Failed</span>';
+          setTimeout(()=>{ validate.classList.remove('show'); validate.classList.add('hide'); setTimeout(()=>{validate.style.display='none';res(false);},400); },1300);
+        }
+      }, 1400);
+    });
+  }
+  function openDoorsAndReveal(){
+    const s = SESSION.get();
+    buildNav(s.role);
+    $('avatar').textContent = (s.employee.name||'A').charAt(0).toUpperCase();
+    app.classList.add('show'); app.setAttribute('aria-hidden','false');
+    // Re-show V halves so they split with the doors (mirror of closing)
+    halves.forEach(h=>h.classList.remove('fading'));
+    // Brief pause to ensure V is visible, then split doors apart
+    setTimeout(()=>{
+      stage.classList.remove('doors-closed','neon');
+      stage.classList.add('doors-open');
+      setTimeout(()=>{
+        const first = (NAV[s.role]||NAV.employee)[0].id;
+        switchView(first);
+      }, 700);
+    }, 600);
+  }
+
+  // Login tabs (Employee / Admin)
+  const tabEmp = $('tabEmp'), tabAdm = $('tabAdm'), loginRole = $('loginRole'), loginHint = $('loginHint');
+  function setLoginTab(role){
+    loginRole.value = role;
+    const active = role==='admin'?tabAdm:tabEmp, idle = role==='admin'?tabEmp:tabAdm;
+    active.classList.add('active'); idle.classList.remove('active');
+    active.style.background = 'linear-gradient(180deg,var(--gold-soft),var(--gold))';
+    active.style.color = '#0a0a0a';
+    idle.style.background = 'transparent';
+    idle.style.color = '#aaa';
+    loginHint.textContent = role==='admin' ? 'Developed by Faraz Shahzad' : 'Developed by Faraz Shahzad';
+    $('u').placeholder = role==='admin' ? '' : '';
+  }
+  tabEmp.addEventListener('click',()=>setLoginTab('employee'));
+  tabAdm.addEventListener('click',()=>setLoginTab('admin'));
+
+  form.addEventListener('submit', async e=>{
+    e.preventDefault();
+    err.classList.remove('show');
+    const u = $('u').value.trim(), p = $('p').value;
+    signin.disabled=true; signin.innerHTML='<span class="btn-spinner"></span> Verifying…';
+    const r = await api('verifyLogin',{u, password:p});
+    let ok = r.ok;
+    if (ok && r.data.role !== loginRole.value){
+      ok = false;
+      r.error = `This account is not an ${loginRole.value}. Please switch tab.`;
+    }
+    const res = await runValidation(ok);
+    if (res){
+      SESSION.set({ role:r.data.role, employee:r.data.employee, at:Date.now() });
+      openDoorsAndReveal();
+    } else {
+      err.textContent = r.error || 'Invalid credentials. Please try again.';
+      err.classList.add('show');
+      signin.disabled=false; signin.textContent='Sign In';
+    }
+  });
+
+  $('forgotLink').addEventListener('click', e=>{
+    e.preventDefault();
+    toast('Please contact HR at hr@veclartechnologies.com','');
+  });
+  $('logoutBtn').addEventListener('click', ()=>{
+    SESSION.clear();
+    location.reload();
+  });
+
+  function boot(){
+    if (SESSION.get()){
+      const s = SESSION.get();
+      buildNav(s.role);
+      $('avatar').textContent = (s.employee.name||'A').charAt(0).toUpperCase();
+      app.classList.add('show'); app.setAttribute('aria-hidden','false');
+      stage.classList.add('doors-open');
+      const first = (NAV[s.role]||NAV.employee)[0].id;
+      switchView(first);
+      login.style.display='none';
+      return;
+    }
+    // doors closed initially? No: start open (off-screen) then slam closed
+    setTimeout(async ()=>{
+      await closeDoorsSlam();          // doors slam, V halves meet, neon burst
+      await holdNeonAndShowLogin();    // 2s hold, then login appears
+    }, 280);
+  }
+
+/* ================================================================
+ * VECLAR v4 ENHANCEMENTS — control panel, PDF attendance, settings
+ * profile, notifications, search, employee dashboard.
+ * Original code is preserved; this layer overrides via RENDERERS
+ * and DOM manipulation only.
+ * ================================================================ */
+(function VeclarV4(){
+  // ----- Bus + Stores -----
+  const BUS = window.VECLAR_BUS = (function(){
+    const handlers = {};
+    return {
+      on(ev, fn){ (handlers[ev]||(handlers[ev]=[])).push(fn); },
+      emit(ev, payload){ (handlers[ev]||[]).forEach(fn=>{ try{ fn(payload); }catch(e){console.error(e)} }); }
+    };
+  })();
+
+  const NOTIFS_KEY = 'veclar.notifs.v1';
+  const NOTIFS = window.NOTIFS = {
+    all(){ try{ return JSON.parse(localStorage.getItem(NOTIFS_KEY)||'[]'); }catch(e){ return []; } },
+    save(arr){ localStorage.setItem(NOTIFS_KEY, JSON.stringify(arr.slice(0,200))); },
+    push(audience, n){
+      const arr = NOTIFS.all();
+      arr.unshift({id:'n'+Date.now()+Math.floor(Math.random()*999), audience, ts:Date.now(), read:false, ...n});
+      NOTIFS.save(arr);
+      BUS.emit('notif:new', n);
+      renderNotifBadge();
+    },
+    forUser(){
+      const s = SESSION.get(); if (!s) return [];
+      const arr = NOTIFS.all();
+      return arr.filter(n => n.audience==='all' || n.audience===s.role || n.audience===s.employee.empId);
+    },
+    markAllRead(){
+      const s = SESSION.get(); if (!s) return;
+      const arr = NOTIFS.all();
+      arr.forEach(n=>{ if (n.audience==='all'||n.audience===s.role||n.audience===s.employee.empId) n.read=true; });
+      NOTIFS.save(arr); renderNotifBadge();
+    },
+    clear(){ NOTIFS.save([]); renderNotifBadge(); }
+  };
+
+  // ----- Attendance store (PDF-derived) -----
+  const ATT_KEY = 'veclar.attendance.v2';
+  const ATT = window.VECLAR_ATT = {
+    load(){ try{ return JSON.parse(localStorage.getItem(ATT_KEY)||'{}'); }catch(e){ return {}; } },
+    save(o){ localStorage.setItem(ATT_KEY, JSON.stringify(o)); BUS.emit('att:change'); },
+    /* shape: { 'YYYY-MM': { 'empId': [ {date, ci, co, status, deduction, _auto:true} ] } } */
+  };
+
+  // ===== Helpers =====
+  function pad2(n){ return String(n).padStart(2,'0'); }
+  function isoFromParts(y,m,d){ return `${y}-${pad2(m)}-${pad2(d)}`; }
+  function monthKeyFromIso(iso){ return iso.slice(0,7); }
+  function isWeekday(iso){ const d=new Date(iso+'T12:00:00'); return d.getDay()>=1 && d.getDay()<=5; }
+  function weekdaysInMonth(monthKey){
+    const [y,m] = monthKey.split('-').map(Number);
+    const out = [];
+    for(let d=1; d<=new Date(y,m,0).getDate(); d++){
+      const iso = isoFromParts(y,m,d);
+      if (isWeekday(iso)) out.push(iso);
+    }
+    return out;
+  }
+  function monthLabel(monthKey){
+    const [y,m] = monthKey.split('-').map(Number);
+    return new Date(y,m-1,1).toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  }
+  function fmtTime12(hms){
+    if (!hms) return '—';
+    const [h,m] = hms.split(':').map(Number);
+    const am = h<12, hh = ((h%12)||12);
+    return `${hh}:${pad2(m||0)} ${am?'AM':'PM'}`;
+  }
+
+  // Flexible date parser: "26-03-2026", "1/4/2026", "16-04-202" (truncated → assume current decade)
+  function parseFlexDate(str){
+    if (!str) return null;
+    const s = String(str).trim();
+    let m;
+    if ((m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})$/))){
+      let d=+m[1], mo=+m[2], y=+m[3];
+      if (y<100) y += 2000;
+      else if (y>=200 && y<1000) y = 2000 + (y%100); // truncated "202" → 2026 era handled by lookup
+      // The PDF has both d-m-Y (e.g. 26-03-2026) and d/m/Y (1/4/2026). Both day-first.
+      if (mo>12) [d,mo]=[mo,d];
+      if (y < 2000 || y > 2100) return null;
+      if (y === 2002 && /202$/.test(m[3])) y = 2026; // safety for "16-04-202"
+      return isoFromParts(y,mo,d);
+    }
+    return null;
+  }
+
+  // Parse PDF text into raw rows
+  async function parsePdfAttendance(file){
+    if (!window.pdfjsLib){
+      // load on-demand
+      await new Promise((res,rej)=>{
+        const s=document.createElement('script');
+        s.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs';
+        s.type='module';
+        s.onload=res; s.onerror=rej;
+        document.head.appendChild(s);
+        // fallback to non-module classic
+        setTimeout(()=>{ if(!window.pdfjsLib){
+          const s2=document.createElement('script');
+          s2.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+          s2.onload=res; s2.onerror=rej;
+          document.head.appendChild(s2);
+        }}, 400);
+      });
+    }
+    if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions){
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+    const buf = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({data:buf}).promise;
+    const rows = [];
+    const seen = new Set();
+    const pushRow = (empId, dateRaw, timeRaw, name, status)=>{
+      const date = parseFlexDate(dateRaw);
+      if (!date) return;
+      const tparts = timeRaw.split(':');
+      const time = pad2(+tparts[0])+':'+pad2(+(tparts[1]||0));
+      const key = `${empId}|${date}|${time}|${status}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push({empId, date, time, name:(name||'').trim(), status:/in/i.test(status)?'CheckIn':'CheckOut'});
+    };
+    // Global pattern allowing names with letters/spaces/dots and tolerating truncated dates ("16-04-202").
+    // We scan the joined page text — robust to table cells, separate y-rows and multi-column layouts.
+    const GLOBAL_RE = /(\d{1,3})\s+(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+([A-Za-z][A-Za-z .\-]*?)\s+(CheckIn|CheckOut)/g;
+    for (let p=1; p<=pdf.numPages; p++){
+      const page = await pdf.getPage(p);
+      const tc = await page.getTextContent();
+      // 1) Per-row pass (preferred — gives best name fidelity for tables)
+      const byRow = {};
+      tc.items.forEach(it=>{
+        const y = Math.round(it.transform[5]);
+        (byRow[y] = byRow[y] || []).push({x:it.transform[4], s:(it.str||'').trim()});
+      });
+      Object.keys(byRow).map(Number).sort((a,b)=>b-a).forEach(y=>{
+        const cells = byRow[y].sort((a,b)=>a.x-b.x).map(c=>c.s).filter(Boolean);
+        if (!cells.length) return;
+        const line = cells.join(' ').replace(/\s+/g,' ').trim();
+        const mm = line.match(/^(\d{1,3})\s+(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+?)\s+(CheckIn|CheckOut)\s*$/i);
+        if (mm) pushRow(mm[1], mm[2], mm[3], mm[4], mm[5]);
+      });
+      // 2) Whole-page fallback pass — catches rows the y-grouping missed
+      // (e.g. table cells split across many y values, or page-break rows).
+      const pageText = tc.items.map(it=>it.str||'').join(' ').replace(/\s+/g,' ');
+      let mg;
+      GLOBAL_RE.lastIndex = 0;
+      while ((mg = GLOBAL_RE.exec(pageText)) !== null){
+        pushRow(mg[1], mg[2], mg[3], mg[4], mg[5]);
+      }
+    }
+    return rows;
+  }
+
+  // Map ZK empId (numeric string) → app emp record
+  function resolveEmpFromZk(zkId, allEmps, name){
+    // 1) explicit zkEmpId mapping on profile (preferred)
+    let hit = allEmps.find(e => String(e.zkEmpId||'')===String(zkId));
+    if (hit) return hit;
+    // 2) numeric portion of empId (e.g. V011 -> 11)
+    hit = allEmps.find(e => String(e.empId||'').replace(/\D/g,'')===String(zkId));
+    if (hit) return hit;
+    // 3) name-based fallback (PDF carries the real name on every row)
+    if (name){
+      const norm = s => String(s||'').toLowerCase().replace(/[^a-z]/g,'');
+      const target = norm(name);
+      if (target){
+        hit = allEmps.find(e => norm(e.name)===target);
+        if (hit) return hit;
+        // partial: same first+last token
+        const tokens = target;
+        hit = allEmps.find(e => norm(e.name).includes(tokens) || tokens.includes(norm(e.name)));
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
+
+  // Build per-employee/per-day rows from raw rows. Shift = 18:00 → 03:00 next day.
+  function pairAttendance(rawRows, allEmps){
+    // group by (empId, date) — but CheckOuts in early AM belong to PREVIOUS day's shift.
+    const byEmp = {};
+    const zkMeta = {}; // key -> {zkId, name} for unmapped
+    rawRows.forEach(r=>{
+      const e = resolveEmpFromZk(r.empId, allEmps, r.name);
+      const key = e ? e.empId : `ZK${r.empId}`;
+      if (!e){
+        zkMeta[key] = zkMeta[key] || {zkId:r.empId, name:r.name||('ZK '+r.empId)};
+      }
+      (byEmp[key] = byEmp[key] || []).push({...r, _resolved:e});
+    });
+
+    // Determine month from the modal of dates
+    const monthCounts = {};
+    rawRows.forEach(r=>{ const k = monthKeyFromIso(r.date); monthCounts[k]=(monthCounts[k]||0)+1; });
+    const monthKey = Object.keys(monthCounts).sort((a,b)=>monthCounts[b]-monthCounts[a])[0]
+      || new Date().toISOString().slice(0,7);
+
+    const result = { monthKey, byEmp: {}, zkMeta };
+    Object.keys(byEmp).forEach(eid=>{
+      const list = byEmp[eid].slice().sort((a,b)=> (a.date+a.time) < (b.date+b.time) ? -1 : 1);
+      const weekdays = weekdaysInMonth(monthKey);
+      const rows = weekdays.map(D=>{
+        const cis = list.filter(x=> x.status==='CheckIn' && x.date===D && x.time>='12:00');
+        const ci = cis.length ? cis[cis.length-1].time : null;
+        let co = null;
+        if (ci){
+          const sameDay = list.filter(x=> x.status==='CheckOut' && x.date===D && x.time>ci);
+          if (sameDay.length) co = sameDay[0].time;
+          else {
+            const d2 = new Date(D+'T12:00:00'); d2.setDate(d2.getDate()+1);
+            const nextIso = d2.toISOString().slice(0,10);
+            const next = list.filter(x=> x.status==='CheckOut' && x.date===nextIso && x.time<'12:00');
+            if (next.length) co = next[0].time;
+          }
+        }
+        return { date:D, ci, co };
+      });
+      result.byEmp[eid] = rows;
+    });
+    return result;
+  }
+
+  // Auto-status & deduction
+  function autoStatusForRow(row, emp, monthKey, allReqs){
+    if (!row.ci){
+      // check approved leave covering this date
+      const lv = (allReqs||[]).find(r=>
+        r.empId===emp.empId &&
+        (r.type||'').toLowerCase().includes('leave') &&
+        r.status==='Approved' &&
+        r.date===row.date
+      );
+      if (lv){
+        if (/casual|sick|paid/i.test(lv.type)) return 'Paid Leave';
+        return 'Unpaid Leave';
+      }
+      return 'Absent';
+    }
+    const t = row.ci; // HH:MM
+    if (t <= '18:15') return 'Present';
+    if (t <= '18:20') return 'Late (12%)';
+    if (t <= '18:30') return 'Late (25%)';
+    return 'Late (25%)';
+  }
+  function dailyWageFor(emp, monthKey){
+    // Use computePayrollFor base; or basic/workingDays as fallback
+    try{
+      const p = computePayrollFor(emp, DEMO, {cycleKey: monthKey});
+      if (p && p.daily) return p.daily;
+    }catch(e){}
+    const wd = weekdaysInMonth(monthKey).length || 22;
+    return (emp.basicSalary || VECLAR.MIN_BASIC_SALARY) / wd;
+  }
+  function deductionFor(status, emp, monthKey){
+    const dw = dailyWageFor(emp, monthKey);
+    if (status==='Present' || status==='Paid Leave') return 0;
+    if (status==='Late (12%)') return Math.round(dw*0.12);
+    if (status==='Late (25%)') return Math.round(dw*0.25);
+    if (status==='Half Day') return Math.round(dw*0.5);
+    if (status==='Absent' || status==='Unpaid Leave') return Math.round(dw);
+    if (status==='Late') return Math.round(dw*0.25);
+    return 0;
+  }
+  const STATUS_OPTIONS = ['Present','Late (12%)','Late (25%)','Late','Half Day','Absent','Unpaid Leave','Paid Leave'];
+
+  // Persist attendance for a month
+  window.__veclarSaveAttendance = function(monthKey, paired){
+    const store = ATT.load();
+    store[monthKey] = paired; // {byEmp:{...}}
+    ATT.save(store);
+    NOTIFS.push('employee', {title:'Attendance posted', body:`Attendance for ${monthLabel(monthKey)} is now available`, link:'attendance'});
+  };
+  window.__veclarGetAttendance = function(monthKey){
+    return ATT.load()[monthKey] || null;
+  };
+  window.__veclarLatestMonthFor = function(empId){
+    const store = ATT.load();
+    const keys = Object.keys(store).sort().reverse();
+    for (const k of keys){
+      if (store[k] && store[k].byEmp && store[k].byEmp[empId]) return k;
+    }
+    return null;
+  };
+  window.__attendanceDeductionsFor = function(empId, monthKey){
+    const m = (ATT.load()[monthKey]||{}).byEmp || {};
+    const rows = m[empId] || [];
+    let total = 0, late=0, absent=0, half=0, present=0;
+    rows.forEach(r=>{
+      total += Number(r.deduction||0);
+      if ((r.status||'').startsWith('Late')) late++;
+      else if (r.status==='Absent') absent++;
+      else if (r.status==='Half Day') half++;
+      else if (r.status==='Present') present++;
+    });
+    return {total, late, absent, half, present, rows};
+  };
+
+  // ============ TOPBAR: profile + notifications + search ============
+  function renderNotifBadge(){
+    const btn = document.getElementById('notifBtn');
+    if (!btn) return;
+    const dot = btn.querySelector('.dot');
+    const unread = NOTIFS.forUser().filter(n=>!n.read).length;
+    if (unread>0){ dot.style.display='flex'; dot.textContent = unread>9?'9+':String(unread); }
+    else { dot.style.display='none'; }
+  }
+  function buildPops(){
+    if (document.getElementById('vxProfilePop')) return;
+    const pp = document.createElement('div');
+    pp.id='vxProfilePop'; pp.className='vx-pop';
+    document.body.appendChild(pp);
+    const np = document.createElement('div');
+    np.id='vxNotifPop'; np.className='vx-pop';
+    document.body.appendChild(np);
+    const sp = document.createElement('div');
+    sp.id='vxSearchPop'; sp.className='vx-search-results';
+    document.body.appendChild(sp);
+
+    document.addEventListener('click', (e)=>{
+      if (!pp.contains(e.target) && e.target.id!=='avatar') pp.classList.remove('show');
+      if (!np.contains(e.target) && !document.getElementById('notifBtn').contains(e.target)) np.classList.remove('show');
+      if (!sp.contains(e.target) && e.target.id!=='globalSearch') sp.classList.remove('show');
+    });
+  }
+
+  function openProfilePop(){
+    const s = SESSION.get(); if (!s) return;
+    const emp = s.employee;
+    const pop = document.getElementById('vxProfilePop');
+    const photo = (window._empPhoto&&window._empPhoto(emp,0)) || '';
+    pop.innerHTML = `
+      <div class="vx-head">
+        <div class="vx-avatar" style="background-image:url('${photo}')"></div>
+        <div>
+          <div class="vx-name">${emp.name||'—'}</div>
+          <div class="vx-id">${emp.empId||''}</div>
+          ${(emp.dept==='Sales' && emp.pseudoName)?`<div class="vx-pseudo">aka ${emp.pseudoName}</div>`:''}
+        </div>
+      </div>
+      <div class="vx-actions">
+        <button id="vxGoProfile">View Profile</button>
+        <button id="vxLogout">Logout</button>
+      </div>`;
+    pop.classList.add('show');
+    document.getElementById('vxGoProfile').onclick = ()=>{ pop.classList.remove('show'); switchView(s.role==='admin'?'settings':'profile'); };
+    document.getElementById('vxLogout').onclick = ()=>{ SESSION.clear(); location.reload(); };
+  }
+  function openNotifPop(){
+    const pop = document.getElementById('vxNotifPop');
+    const list = NOTIFS.forUser();
+    pop.innerHTML = `
+      <div class="vx-head" style="border:none;padding-bottom:6px">
+        <div style="flex:1"><div class="vx-name">Notifications</div><div class="vx-id">${list.length} total · ${list.filter(n=>!n.read).length} new</div></div>
+        ${list.length?`<span class="vx-notif-clear" id="vxNotifClear">Clear</span>`:''}
+      </div>
+      <div class="vx-notif">${
+        list.length ? list.slice(0,30).map(n=>`
+          <div class="vx-notif-item ${n.read?'':'unread'}" data-link="${n.link||''}">
+            <span class="vx-dot"></span>
+            <div class="vx-nbody">
+              <div class="vx-ntitle">${n.title||'Update'}</div>
+              <div style="font-size:11.5px;color:#bbb;margin-top:2px">${n.body||''}</div>
+              <div class="vx-nmeta">${timeAgo(n.ts)}</div>
+            </div>
+          </div>`).join('')
+        : `<div class="vx-notif-empty">No notifications yet</div>`
+      }</div>`;
+    pop.classList.add('show');
+    NOTIFS.markAllRead();
+    const cl = document.getElementById('vxNotifClear');
+    if (cl) cl.onclick = ()=>{ NOTIFS.clear(); openNotifPop(); };
+    pop.querySelectorAll('.vx-notif-item').forEach(it=>{
+      it.onclick = ()=>{ const lk = it.dataset.link; if (lk) switchView(lk); pop.classList.remove('show'); };
+    });
+  }
+  function timeAgo(ts){
+    const s = Math.floor((Date.now()-ts)/1000);
+    if (s<60) return 'Just now';
+    if (s<3600) return Math.floor(s/60)+'m ago';
+    if (s<86400) return Math.floor(s/3600)+'h ago';
+    return Math.floor(s/86400)+'d ago';
+  }
+
+  // ============ SEARCH ============
+  async function runSearch(q){
+    const pop = document.getElementById('vxSearchPop');
+    if (!q || q.length<2){ pop.classList.remove('show'); return; }
+    const session = SESSION.get();
+    const emps = ((await api('listEmployees',{})).data||[]);
+    const reqs = ((await api('listRequests',{})).data||[]);
+    const Q = q.toLowerCase();
+    const matchEmps = emps.filter(e=>
+      (e.name||'').toLowerCase().includes(Q) ||
+      (e.empId||'').toLowerCase().includes(Q) ||
+      (e.dept||'').toLowerCase().includes(Q) ||
+      (e.email||'').toLowerCase().includes(Q) ||
+      (e.pseudoName||'').toLowerCase().includes(Q)
+    ).slice(0,8);
+    const matchReqs = reqs.filter(r=>
+      (r.type||'').toLowerCase().includes(Q) ||
+      (r.reason||'').toLowerCase().includes(Q) ||
+      (r.status||'').toLowerCase().includes(Q)
+    ).slice(0,8);
+    const isAdmin = session && session.role==='admin';
+    let html = '';
+    if (matchEmps.length && isAdmin){
+      html += `<div class="vx-sgroup">Employees</div>`;
+      html += matchEmps.map(e=>`<div class="vx-sitem" data-go="people" data-id="${e.empId}"><div><div class="vx-stitle">${e.name}</div><div class="vx-ssub">${e.empId} · ${e.dept} · ${e.title||''}</div></div></div>`).join('');
+    }
+    if (matchReqs.length){
+      html += `<div class="vx-sgroup">Requests</div>`;
+      html += matchReqs.map(r=>{
+        const emp = emps.find(e=>e.empId===r.empId);
+        return `<div class="vx-sitem" data-go="${isAdmin?'admin-requests':'requests'}"><div><div class="vx-stitle">${r.type} — ${emp?emp.name:r.empId}</div><div class="vx-ssub">${r.status} · ${r.date} · ${(r.reason||'').slice(0,60)}</div></div></div>`;
+      }).join('');
+    }
+    if (!html) html = `<div class="vx-sempty">No matches for "${q}"</div>`;
+    pop.innerHTML = html;
+    pop.classList.add('show');
+    pop.querySelectorAll('.vx-sitem').forEach(it=>{
+      it.onclick = ()=>{ switchView(it.dataset.go); pop.classList.remove('show'); document.getElementById('globalSearch').value=''; };
+    });
+  }
+
+  function wireTopbar(){
+    buildPops();
+    const av = document.getElementById('avatar');
+    if (av) av.onclick = openProfilePop;
+    const nb = document.getElementById('notifBtn');
+    if (nb) nb.onclick = openNotifPop;
+    const sb = document.getElementById('globalSearch');
+    if (sb){
+      let t;
+      sb.addEventListener('input', e=>{ clearTimeout(t); t=setTimeout(()=>runSearch(e.target.value.trim()), 180); });
+      sb.addEventListener('focus', e=>runSearch(e.target.value.trim()));
+    }
+    renderNotifBadge();
+  }
+
+  // ============ Charts (mini SVG helpers) ============
+  function svgLine(data, opts){
+    opts = opts||{};
+    const w = opts.w||440, h = opts.h||140, pad=24;
+    const max = Math.max(1, ...data.map(d=>d.v));
+    const stepX = (w-pad*2)/Math.max(1,data.length-1);
+    const pts = data.map((d,i)=>[pad+i*stepX, h-pad-(d.v/max)*(h-pad*2)]);
+    const path = pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
+    const area = path+` L${pts[pts.length-1][0]},${h-pad} L${pts[0][0]},${h-pad} Z`;
+    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <defs><linearGradient id="vxg1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#d6a62a" stop-opacity=".5"/><stop offset="1" stop-color="#d6a62a" stop-opacity="0"/></linearGradient></defs>
+      <path d="${area}" fill="url(#vxg1)"/>
+      <path d="${path}" fill="none" stroke="#d6a62a" stroke-width="2"/>
+      ${pts.map((p,i)=>`<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="#d6a62a"/><text x="${p[0]}" y="${h-6}" text-anchor="middle" font-size="9" fill="#888">${data[i].l||''}</text>`).join('')}
+    </svg>`;
+  }
+  function svgBar(data, opts){
+    opts = opts||{};
+    const w = opts.w||440, h = opts.h||160, pad=28;
+    const max = Math.max(1, ...data.map(d=>d.v));
+    const bw = (w-pad*2)/data.length - 8;
+    return `<svg viewBox="0 0 ${w} ${h}">
+      ${data.map((d,i)=>{
+        const x = pad+i*((w-pad*2)/data.length)+4;
+        const bh = (d.v/max)*(h-pad*2);
+        const y = h-pad-bh;
+        return `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${d.c||'#d6a62a'}" rx="4"/>
+                <text x="${x+bw/2}" y="${h-8}" text-anchor="middle" font-size="9" fill="#888">${d.l}</text>
+                <text x="${x+bw/2}" y="${y-4}" text-anchor="middle" font-size="10" fill="#ddd" font-weight="600">${d.v}</text>`;
+      }).join('')}
+    </svg>`;
+  }
+  function svgDonut(data, opts){
+    opts = opts||{};
+    const size = opts.size||160, r = size/2-12, cx = size/2, cy = size/2;
+    const total = data.reduce((s,d)=>s+d.v,0)||1;
+    let a0 = -Math.PI/2;
+    const colors = ['#d6a62a','#7adf8a','#7ab7ff','#f5c451','#ff4d4f','#e6bd4a'];
+    const arcs = data.map((d,i)=>{
+      const a1 = a0 + (d.v/total)*Math.PI*2;
+      const large = (a1-a0)>Math.PI?1:0;
+      const x0 = cx+Math.cos(a0)*r, y0 = cy+Math.sin(a0)*r;
+      const x1 = cx+Math.cos(a1)*r, y1 = cy+Math.sin(a1)*r;
+      const path = `M${cx},${cy} L${x0},${y0} A${r},${r} 0 ${large} 1 ${x1},${y1} Z`;
+      a0 = a1;
+      return `<path d="${path}" fill="${d.c||colors[i%colors.length]}" opacity=".9"><title>${d.l}: ${d.v}</title></path>`;
+    }).join('');
+    return `<svg viewBox="0 0 ${size} ${size}" style="max-width:${size}px;margin:0 auto;display:block">
+      ${arcs}
+      <circle cx="${cx}" cy="${cy}" r="${r*0.55}" fill="#0a0a0b"/>
+      <text x="${cx}" y="${cy-2}" text-anchor="middle" font-size="20" fill="#d6a62a" font-weight="700">${total}</text>
+      <text x="${cx}" y="${cy+14}" text-anchor="middle" font-size="9" fill="#888">${opts.label||'TOTAL'}</text>
+    </svg>`;
+  }
+
+  // 3D Calendar
+  function build3DCal(monthDate){
+    monthDate = monthDate || new Date();
+    const y = monthDate.getFullYear(), m = monthDate.getMonth();
+    const today = new Date();
+    const first = new Date(y,m,1), last = new Date(y,m+1,0);
+    const startDow = first.getDay();
+    const dows = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    let html = `<div class="vx-3dcal"><div class="vx-calhead"><h4>${first.toLocaleDateString(undefined,{month:'long',year:'numeric'})} · Calendar</h4>
+      <div style="display:flex;gap:6px"><button class="vx-btn ghost" data-cal="-1">‹ Prev</button><button class="vx-btn ghost" data-cal="+1">Next ›</button></div></div><div class="vx-grid">`;
+    dows.forEach(d=>html+=`<div class="vx-dow">${d}</div>`);
+    for(let i=0;i<startDow;i++) html+=`<div></div>`;
+    for(let d=1; d<=last.getDate(); d++){
+      const dt = new Date(y,m,d);
+      const cls=['vx-day'];
+      if (dt.getDay()===0 || dt.getDay()===6) cls.push('weekend');
+      if (dt.toDateString()===today.toDateString()) cls.push('today');
+      html += `<div class="${cls.join(' ')}">${d}</div>`;
+    }
+    html+=`</div></div>`;
+    return html;
+  }
+
+  // ============ ADMIN DASHBOARD override ============
+  RENDERERS.dashboard = async function(){
+    const s = SESSION.get(); if (!s) return;
+    const v = $('view-dashboard'); v.innerHTML='';
+    const emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old');
+    const reqs = (await api('listRequests',{})).data||[];
+    const today = todayKey();
+    const att = (await api('listAttendance',{date:today})).data||[];
+    const pending = reqs.filter(r=>r.status==='Pending').length;
+    const approved = reqs.filter(r=>r.status==='Approved').length;
+    const onLeave = reqs.filter(r=>r.status==='Approved' && r.date===today && (r.type||'').toLowerCase().includes('leave')).length;
+    const lockedCount = emps.filter(e=> window.payLockGet && window.payLockGet(e.empId)).length;
+    const wagebill = emps.reduce((s,e)=>s+Number(e.basicSalary||0),0);
+
+    v.innerHTML = `<div class="hero">
+      <div><h1>Welcome back, <b>${s.employee.name.split(' ')[0]}</b></h1><div class="sub">${VECLAR.COMPANY} · Control Panel · ${new Date().toLocaleDateString(undefined,{weekday:'long',day:'2-digit',month:'long',year:'numeric'})}</div></div>
+      <div class="clock"><div class="t" id="aClk2">--:--:--</div><div class="d" id="aDate2">—</div></div>
+    </div>`;
+    function tk(){ const d=new Date(); const a=$('aClk2'),b=$('aDate2'); if(a)a.textContent=pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); if(b)b.textContent=d.toLocaleDateString(undefined,{weekday:'long',day:'2-digit',month:'short'}); }
+    tk(); clearInterval(window.__aTk); window.__aTk=setInterval(tk,1000);
+
+    const tiles = [
+      {l:'Total Employees', n:emps.length, s:`${VECLAR.DEPARTMENTS.length} departments`, ic:'👥'},
+      {l:'Present Today', n:att.length, s:`${Math.round(att.length/Math.max(1,emps.length-1)*100)}% attendance`, ic:'✅'},
+      {l:'On Leave', n:onLeave, s:'Today', ic:'🌴'},
+      {l:'Pending Requests', n:pending, s:`${approved} approved`, ic:'📋'},
+      {l:'Payroll Locked', n:lockedCount+'/'+emps.length, s:`${Math.round(lockedCount/Math.max(1,emps.length)*100)}%`, ic:'🔒'},
+      {l:'Monthly Wage Bill', n:'₨'+(wagebill/1000).toFixed(0)+'k', s:'Gross basic', ic:'💰'}
+    ];
+    const dash = document.createElement('div'); dash.className='vx-dash';
+    tiles.forEach(t=>{
+      const c = document.createElement('div'); c.className='vx-tile';
+      c.innerHTML = `<div class="vx-ic">${t.ic}</div><div class="vx-l">${t.l}</div><div class="vx-n">${t.n}</div><div class="vx-s">${t.s}</div>`;
+      dash.appendChild(c);
+    });
+    v.appendChild(dash);
+
+    // Charts
+    const charts = document.createElement('div'); charts.className='vx-charts';
+
+    // 1. Attendance trend last 7 working days
+    const trend = [];
+    for (let i=6;i>=0;i--){
+      const d = new Date(); d.setDate(d.getDate()-i);
+      if (!VECLAR.WORKING_DAYS.includes(d.getDay())) continue;
+      const k = todayKey(d);
+      const list = (await api('listAttendance',{date:k})).data||[];
+      trend.push({l:d.toLocaleDateString(undefined,{weekday:'short'}), v:list.length});
+    }
+    const c1 = document.createElement('div'); c1.className='vx-chart';
+    c1.innerHTML = `<h4>Attendance Trend</h4>${svgLine(trend)}`;
+    charts.appendChild(c1);
+
+    // 2. Headcount by Department donut
+    const dept = VECLAR.DEPARTMENTS.map(d=>({l:d, v:emps.filter(e=>e.dept===d).length})).filter(x=>x.v>0);
+    const c2 = document.createElement('div'); c2.className='vx-chart';
+    c2.innerHTML = `<h4>Headcount by Department</h4>${svgDonut(dept,{label:'EMPLOYEES'})}
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;justify-content:center">
+        ${dept.map((d,i)=>`<span style="font-size:10px;color:#bbb"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${['#d6a62a','#7adf8a','#7ab7ff','#f5c451','#ff4d4f','#e6bd4a'][i%6]};margin-right:4px"></span>${d.l} (${d.v})</span>`).join('')}
+      </div>`;
+    charts.appendChild(c2);
+
+    // 3. Requests by status bar
+    const byStatus = ['Pending','Approved','Rejected','Quoted'].map(s=>({l:s, v:reqs.filter(r=>r.status===s).length, c: s==='Approved'?'#7adf8a':s==='Rejected'?'#ff4d4f':s==='Pending'?'#f5c451':'#7ab7ff'}));
+    const c3 = document.createElement('div'); c3.className='vx-chart';
+    c3.innerHTML = `<h4>Requests by Status</h4>${svgBar(byStatus)}`;
+    charts.appendChild(c3);
+
+    // 4. Late distribution from latest attendance month
+    const latestMonth = Object.keys(ATT.load()).sort().pop();
+    let lateRange = [{l:'On time',v:0,c:'#7adf8a'},{l:'Late 12%',v:0,c:'#f5c451'},{l:'Late 25%',v:0,c:'#e6bd4a'},{l:'Half Day',v:0,c:'#ff944d'},{l:'Absent',v:0,c:'#ff4d4f'}];
+    if (latestMonth && ATT.load()[latestMonth]){
+      const byEmp = ATT.load()[latestMonth].byEmp||{};
+      Object.values(byEmp).flat().forEach(r=>{
+        if (r.status==='Present') lateRange[0].v++;
+        else if (r.status==='Late (12%)') lateRange[1].v++;
+        else if (r.status==='Late (25%)'||r.status==='Late') lateRange[2].v++;
+        else if (r.status==='Half Day') lateRange[3].v++;
+        else if (r.status==='Absent') lateRange[4].v++;
+      });
+    }
+    const c4 = document.createElement('div'); c4.className='vx-chart';
+    c4.innerHTML = `<h4>Punctuality (${latestMonth?monthLabel(latestMonth):'No data'})</h4>${svgBar(lateRange)}`;
+    charts.appendChild(c4);
+
+    v.appendChild(charts);
+
+    // Pending requests table
+    const pendList = reqs.filter(r=>r.status==='Pending').slice(0,5);
+    if (pendList.length){
+      const p = document.createElement('div'); p.className='panel';
+      p.innerHTML = `<h3><span class="accent"></span>Pending Requests (${pendList.length})</h3>
+        <div class="scroll-x"><table class="tbl"><thead><tr><th>Date</th><th>Employee</th><th>Type</th><th>Priority</th><th>Status</th></tr></thead>
+        <tbody>${pendList.map(r=>{const e=emps.find(x=>x.empId===r.empId);return `<tr><td>${fmtDate(r.date)}</td><td>${e?e.name:r.empId}</td><td>${r.type}</td><td>${r.priority||'Normal'}</td><td><span class="pill warn">${r.status}</span></td></tr>`;}).join('')}</tbody></table></div>`;
+      p.style.cursor='pointer'; p.onclick=()=>switchView('admin-requests');
+      v.appendChild(p);
+    }
+
+    // 3D Calendar
+    const calWrap = document.createElement('div');
+    let calDate = new Date();
+    function paintCal(){ calWrap.innerHTML = build3DCal(calDate);
+      calWrap.querySelectorAll('[data-cal]').forEach(b=>b.onclick=()=>{ calDate.setMonth(calDate.getMonth()+ (b.dataset.cal==='+1'?1:-1)); paintCal(); }); }
+    paintCal();
+    v.appendChild(calWrap);
+  };
+
+  // ============ ADMIN ATTENDANCE override (PDF flow) ============
+  const ORIG_ADMIN_ATT = RENDERERS['admin-attendance'];
+  RENDERERS['admin-attendance'] = async function(){
+    const v = $('view-admin-attendance'); v.innerHTML='';
+    const emps = ((await api('listEmployees',{})).data||[]).filter(e=>e.status!=='Old' && e.role==='employee');
+    const allReqs = (await api('listRequests',{})).data||[];
+
+    const store = ATT.load();
+    const monthKeys = Object.keys(store).sort().reverse();
+    let currentMonth = monthKeys[0] || new Date().toISOString().slice(0,7);
+    let deptFilter = '', empFilter = '', statusFilter = '';
+
+    v.innerHTML = `<div class="hero">
+      <div><h1>Admin <b>Attendance</b></h1><div class="sub">Import biometric PDF · Office shift 06:00 PM → 03:00 AM · Mon–Fri</div></div>
+    </div>`;
+
+    // Toolbar
+    const bar = document.createElement('div'); bar.className='vx-att-bar';
+    bar.innerHTML = `
+      <button class="vx-btn" id="vxImport">📥 Import Attendance</button>
+      <input type="file" id="vxImportFile" accept=".pdf" style="display:none"/>
+      <button class="vx-btn ghost" id="vxImportSample">Use Bundled PDF</button>
+      <button class="vx-btn ghost" id="vxDownload">⬇ Download Report</button>
+      <div class="vx-fil"><label>Month</label><select id="vxMonth"></select></div>
+      <div class="vx-fil"><label>Department</label><select id="vxDept"><option value="">All</option>${VECLAR.DEPARTMENTS.map(d=>`<option>${d}</option>`).join('')}</select></div>
+      <div class="vx-fil"><label>Employee</label><select id="vxEmp"><option value="">All</option>${emps.map(e=>`<option value="${e.empId}">${e.name}</option>`).join('')}</select></div>
+      <div class="vx-fil"><label>Status</label><select id="vxStatusF"><option value="">All</option>${STATUS_OPTIONS.map(s=>`<option>${s}</option>`).join('')}</select></div>
+    `;
+    v.appendChild(bar);
+
+    const stats = document.createElement('div'); stats.className='vx-dash'; v.appendChild(stats);
+    const tableWrap = document.createElement('div'); tableWrap.className='vx-att-wrap'; v.appendChild(tableWrap);
+
+    function refreshMonthSelect(){
+      const sel = bar.querySelector('#vxMonth');
+      const keys = Object.keys(ATT.load()).sort().reverse();
+      sel.innerHTML = keys.length ? keys.map(k=>`<option value="${k}" ${k===currentMonth?'selected':''}>${monthLabel(k)}</option>`).join('')
+        : `<option value="${currentMonth}">${monthLabel(currentMonth)}</option>`;
+    }
+
+    function ensureMonth(monthKey){
+      const s = ATT.load();
+      if (!s[monthKey]){
+        // build empty skeleton for all emps in this month (all weekdays → Absent / Paid Leave if approved)
+        const weekdays = weekdaysInMonth(monthKey);
+        const byEmp = {};
+        emps.forEach(e=>{
+          byEmp[e.empId] = weekdays.map(D=>{
+            const row = {date:D, ci:null, co:null};
+            row.status = autoStatusForRow(row, e, monthKey, allReqs);
+            row.deduction = deductionFor(row.status, e, monthKey);
+            row._auto = true;
+            return row;
+          });
+        });
+        s[monthKey] = {byEmp};
+        ATT.save(s);
+      }
+    }
+
+    function ensureAllEmpsInMonth(monthKey){
+      const s = ATT.load();
+      if (!s[monthKey]) return;
+      const weekdays = weekdaysInMonth(monthKey);
+      emps.forEach(e=>{
+        if (!s[monthKey].byEmp[e.empId]){
+          s[monthKey].byEmp[e.empId] = weekdays.map(D=>{
+            const row = {date:D, ci:null, co:null};
+            row.status = autoStatusForRow(row,e,monthKey,allReqs);
+            row.deduction = deductionFor(row.status,e,monthKey);
+            row._auto = true;
+            return row;
+          });
+        } else {
+          // fill missing weekdays as Absent
+          const existing = new Set(s[monthKey].byEmp[e.empId].map(r=>r.date));
+          weekdays.forEach(D=>{
+            if (!existing.has(D)){
+              const row = {date:D, ci:null, co:null};
+              row.status = autoStatusForRow(row,e,monthKey,allReqs);
+              row.deduction = deductionFor(row.status,e,monthKey);
+              row._auto = true;
+              s[monthKey].byEmp[e.empId].push(row);
+            }
+          });
+          s[monthKey].byEmp[e.empId].sort((a,b)=>a.date<b.date?-1:1);
+          // For rows with ci but no status (just paired), auto-fill
+          s[monthKey].byEmp[e.empId].forEach(row=>{
+            if (!row.status){
+              row.status = autoStatusForRow(row,e,monthKey,allReqs);
+              row.deduction = deductionFor(row.status,e,monthKey);
+              row._auto = true;
+            }
+          });
+        }
+      });
+      ATT.save(s);
+    }
+
+    function paintStats(){
+      const data = (ATT.load()[currentMonth]||{}).byEmp || {};
+      let total=0, present=0, late=0, absent=0, half=0, deduct=0;
+      Object.values(data).flat().forEach(r=>{
+        total++;
+        if (r.status==='Present') present++;
+        else if ((r.status||'').startsWith('Late')) late++;
+        else if (r.status==='Absent') absent++;
+        else if (r.status==='Half Day') half++;
+        deduct += Number(r.deduction||0);
+      });
+      const tiles = [
+        {l:'Records', n:total, s:monthLabel(currentMonth), ic:'📊'},
+        {l:'Present', n:present, s:`${Math.round(present/Math.max(1,total)*100)}%`, ic:'✅'},
+        {l:'Late', n:late, s:'12% / 25%', ic:'⏰'},
+        {l:'Half Day', n:half, s:'50% deduction', ic:'🌗'},
+        {l:'Absent', n:absent, s:'100% deduction', ic:'❌'},
+        {l:'Total Deduction', n:'₨'+(deduct/1000).toFixed(1)+'k', s:'This month', ic:'💸'}
+      ];
+      stats.innerHTML = tiles.map(t=>`<div class="vx-tile"><div class="vx-ic">${t.ic}</div><div class="vx-l">${t.l}</div><div class="vx-n">${t.n}</div><div class="vx-s">${t.s}</div></div>`).join('');
+    }
+
+    function paintTable(){
+      const data = (ATT.load()[currentMonth]||{}).byEmp || {};
+      const empIds = Object.keys(data).filter(eid=>{
+        if (empFilter && eid!==empFilter) return false;
+        const e = emps.find(x=>x.empId===eid);
+        if (deptFilter && (!e || e.dept!==deptFilter)) return false;
+        return true;
+      });
+      if (!empIds.length){
+        tableWrap.innerHTML = `<div class="vx-att-empty"><h3>No Attendance Yet</h3><p>Click <b>Import Attendance</b> to upload the biometric PDF.</p></div>`;
+        return;
+      }
+      let html = `<table class="vx-att-tbl"><thead><tr>
+        <th>EMP ID</th><th>Date</th><th>Name</th><th>Check In / Out</th><th>Status</th><th>Deduction (PKR)</th></tr></thead><tbody>`;
+      empIds.forEach(eid=>{
+        const e = emps.find(x=>x.empId===eid) || {empId:eid, name:eid};
+        data[eid].slice().sort((a,b)=>a.date<b.date?-1:1).forEach((row,idx)=>{
+          if (statusFilter && row.status!==statusFilter) return;
+          const cls = row.status==='Absent'?'vx-absent':(row.status||'').startsWith('Late')?'vx-late':'';
+          const dt = new Date(row.date+'T12:00:00').toLocaleDateString(undefined,{day:'2-digit',month:'short',weekday:'short'});
+          html += `<tr class="${cls}" data-eid="${eid}" data-idx="${idx}">
+            <td>${e.empId||eid}</td>
+            <td>${dt}</td>
+            <td>${e.name||''}</td>
+            <td><div class="vx-times"><span class="vx-ci">▸ ${fmtTime12(row.ci)}</span><span class="vx-co">◂ ${fmtTime12(row.co)}</span></div></td>
+            <td><select class="vx-status">${STATUS_OPTIONS.map(s=>`<option ${s===row.status?'selected':''}>${s}</option>`).join('')}</select></td>
+            <td><input class="vx-ded" type="number" value="${row.deduction||0}"/></td>
+          </tr>`;
+        });
+      });
+      html += `</tbody></table>`;
+      tableWrap.innerHTML = html;
+
+      tableWrap.querySelectorAll('tr[data-eid]').forEach(tr=>{
+        const eid = tr.dataset.eid, idx = +tr.dataset.idx;
+        const sel = tr.querySelector('.vx-status');
+        const ded = tr.querySelector('.vx-ded');
+        sel.addEventListener('change', ()=>{
+          const s = ATT.load();
+          const row = s[currentMonth].byEmp[eid][idx];
+          row.status = sel.value;
+          row.deduction = deductionFor(sel.value, emps.find(x=>x.empId===eid)||{}, currentMonth);
+          row._auto = false;
+          ATT.save(s);
+          ded.value = row.deduction;
+          paintStats();
+          BUS.emit('payroll:refresh');
+        });
+        ded.addEventListener('change', ()=>{
+          const s = ATT.load();
+          s[currentMonth].byEmp[eid][idx].deduction = Number(ded.value)||0;
+          s[currentMonth].byEmp[eid][idx]._auto = false;
+          ATT.save(s);
+          paintStats();
+          BUS.emit('payroll:refresh');
+        });
+      });
+    }
+
+    function paintAll(){ refreshMonthSelect(); paintStats(); paintTable(); }
+
+    // Import button
+    bar.querySelector('#vxImport').onclick = ()=> bar.querySelector('#vxImportFile').click();
+    bar.querySelector('#vxImportFile').onchange = async (ev)=>{
+      const file = ev.target.files[0]; if (!file) return;
+      await handleImport(file);
+    };
+    bar.querySelector('#vxImportSample').onclick = async ()=>{
+      try{
+        const res = await fetch('Attendance.pdf');
+        if (!res.ok) throw new Error('Not found');
+        const blob = await res.blob();
+        await handleImport(new File([blob], 'Attendance.pdf', {type:'application/pdf'}));
+      }catch(e){ toast('Bundled PDF not found in same folder','bad'); }
+    };
+    async function handleImport(file){
+      toast('Parsing PDF…','');
+      try{
+        const raw = await parsePdfAttendance(file);
+        if (!raw.length){ toast('No rows parsed from PDF','bad'); return; }
+        const paired = pairAttendance(raw, emps);
+        currentMonth = paired.monthKey;
+        const s = ATT.load();
+        s[currentMonth] = {byEmp:{}};
+        let mapped=0, unmapped=0;
+        Object.entries(paired.byEmp).forEach(([eid,rows])=>{
+          // KEEP unmapped ZK keys so the punches actually appear in the grid.
+          // Synthesize a pseudo-emp into local emps[] so the table can show name/dept.
+          if (eid.startsWith('ZK')){
+            unmapped++;
+            const meta = (paired.zkMeta||{})[eid] || {zkId:eid.slice(2), name:eid};
+            if (!emps.find(x=>x.empId===eid)){
+              emps.push({
+                empId: eid,
+                name: meta.name + ' (ZK '+meta.zkId+')',
+                dept: 'Unmapped',
+                title: 'Biometric ID '+meta.zkId,
+                role: 'employee',
+                status: 'Active',
+                zkEmpId: meta.zkId,
+                _synthetic: true
+              });
+            }
+          } else {
+            mapped++;
+          }
+          s[currentMonth].byEmp[eid] = rows;
+        });
+        ATT.save(s);
+        // Fill statuses/deductions for every row that has ci
+        const store = ATT.load();
+        Object.entries(store[currentMonth].byEmp).forEach(([eid,rows])=>{
+          const e = emps.find(x=>x.empId===eid) || {empId:eid, name:eid, basicSalary:VECLAR.MIN_BASIC_SALARY};
+          rows.forEach(r=>{
+            r.status = autoStatusForRow(r, e, currentMonth, allReqs);
+            r.deduction = deductionFor(r.status, e, currentMonth);
+            r._auto = true;
+          });
+        });
+        ATT.save(store);
+        ensureAllEmpsInMonth(currentMonth);
+        NOTIFS.push('employee', {title:'Attendance posted', body:`Records for ${monthLabel(currentMonth)} are now available`, link:'attendance'});
+        NOTIFS.push('admin', {title:'Attendance imported', body:`${raw.length} punches · ${mapped} mapped · ${unmapped} unmapped`, link:'admin-attendance'});
+        toast(`Imported ${raw.length} punches · ${mapped} mapped · ${unmapped} unmapped`,'ok');
+        // Persist month to backend (non-blocking, optimistic)
+        try{ api('saveAttendanceMonth', {monthKey: currentMonth, payload: JSON.stringify(store[currentMonth])}); }catch(_){}
+        paintAll();
+      }catch(e){ console.error(e); toast('PDF parse failed: '+e.message,'bad'); }
+    }
+
+    // Filter listeners
+    bar.querySelector('#vxMonth').onchange = (e)=>{ currentMonth = e.target.value; paintStats(); paintTable(); };
+    bar.querySelector('#vxDept').onchange = (e)=>{ deptFilter = e.target.value; paintTable(); };
+    bar.querySelector('#vxEmp').onchange = (e)=>{ empFilter = e.target.value; paintTable(); };
+    bar.querySelector('#vxStatusF').onchange = (e)=>{ statusFilter = e.target.value; paintTable(); };
+
+    // Download report
+    bar.querySelector('#vxDownload').onclick = ()=>{
+      const data = (ATT.load()[currentMonth]||{}).byEmp||{};
+      const printArea = document.createElement('div'); printArea.id='vxPrintArea';
+      let html = `<h2 style="color:#000;margin-bottom:14px">Veclar Technologies — Attendance Report</h2>
+        <p>${monthLabel(currentMonth)}</p>
+        <table><thead><tr><th>EMP ID</th><th>Date</th><th>Name</th><th>Check In</th><th>Check Out</th><th>Status</th><th>Deduction</th></tr></thead><tbody>`;
+      Object.keys(data).forEach(eid=>{
+        const e = emps.find(x=>x.empId===eid)||{empId:eid,name:eid};
+        data[eid].slice().sort((a,b)=>a.date<b.date?-1:1).forEach(r=>{
+          html+=`<tr><td>${e.empId}</td><td>${r.date}</td><td>${e.name}</td><td>${fmtTime12(r.ci)}</td><td>${fmtTime12(r.co)}</td><td>${r.status||''}</td><td>${r.deduction||0}</td></tr>`;
+        });
+      });
+      html+=`</tbody></table>`;
+      printArea.innerHTML = html;
+      document.body.appendChild(printArea);
+      window.print();
+      setTimeout(()=>printArea.remove(),500);
+    };
+
+    // initial
+    if (!Object.keys(ATT.load()).length){
+      // empty state
+      tableWrap.innerHTML = `<div class="vx-att-empty"><h3>No Attendance Yet</h3><p>Click <b>Use Bundled PDF</b> to load <code>Attendance.pdf</code>, or <b>Import Attendance</b> to upload your biometric export.</p></div>`;
+      refreshMonthSelect();
+      paintStats();
+    } else {
+      ensureAllEmpsInMonth(currentMonth);
+      paintAll();
+    }
+  };
+
+  // ============ Hook payroll to use attendance deductions ============
+  const _origComputePayrollFor = window.computePayrollFor || computePayrollFor;
+  window.computePayrollFor = function(emp, D, opts){
+    const base = _origComputePayrollFor(emp, D, opts);
+    try{
+      const monthKey = (opts && opts.cycleKey) || base.cycleKey || new Date().toISOString().slice(0,7);
+      const att = window.__attendanceDeductionsFor(emp.empId, monthKey);
+      if (att && att.rows.length){
+        const totalDed = att.total;
+        base.attDeduction = totalDed;
+        base.net = Math.max(0, base.net - totalDed); // apply on top
+        base.lates = att.late; base.halfDays = att.half; base.present = att.present;
+      }
+    }catch(e){}
+    return base;
+  };
+
+  // ============ EMPLOYEE: Home (extensive stats) ============
+  RENDERERS.home = async function(){
+    const s = SESSION.get(); if (!s) return;
+    const v = $('view-home'); v.innerHTML='';
+    const emp = s.employee;
+    const r = await api('computePayroll',{empId:emp.empId});
+    const p = r.data||{};
+    const bundle = await api('getEmployeeBundle',{empId:emp.empId});
+    const myReqs = (bundle.data&&bundle.data.requests)||[];
+    const approvedLeaves = myReqs.filter(x=>x.status==='Approved' && (x.type||'').toLowerCase().includes('leave')).length;
+    const latestMonth = window.__veclarLatestMonthFor(emp.empId);
+    const att = latestMonth ? window.__attendanceDeductionsFor(emp.empId, latestMonth) : {present:0,late:0,absent:0,half:0,rows:[]};
+    const totalDays = att.rows.length || 1;
+    const attPct = Math.round((att.present/totalDays)*100);
+
+    v.innerHTML = `<div class="hero">
+      <div><h1>Welcome, <b>${(emp.name||'').split(' ')[0]}</b></h1><div class="sub">${emp.title||''} · ${emp.dept} · ${new Date().toLocaleDateString(undefined,{weekday:'long',day:'2-digit',month:'long'})}</div></div>
+      <div class="clock"><div class="t" id="hClk">--:--:--</div><div class="d">${VECLAR.COMPANY}</div></div>
+    </div>`;
+    (function tk(){ const d=new Date(); const el=$('hClk'); if (el){el.textContent=pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); setTimeout(tk,1000);} })();
+
+    const tiles = [
+      {l:'My Attendance', n:attPct+'%', s:latestMonth?monthLabel(latestMonth):'No data', ic:'📅'},
+      {l:'Late Count', n:att.late, s:'This month', ic:'⏰'},
+      {l:'Approved Leaves', n:approvedLeaves, s:'YTD', ic:'🌴'},
+      {l:'Net Pay (est.)', n:'₨'+((p.net||0)/1000).toFixed(1)+'k', s:'Current cycle', ic:'💰'}
+    ];
+    const dash = document.createElement('div'); dash.className='vx-dash';
+    tiles.forEach(t=>{
+      const c = document.createElement('div'); c.className='vx-tile';
+      c.innerHTML = `<div class="vx-ic">${t.ic}</div><div class="vx-l">${t.l}</div><div class="vx-n">${t.n}</div><div class="vx-s">${t.s}</div>`;
+      dash.appendChild(c);
+    });
+    v.appendChild(dash);
+
+    const charts = document.createElement('div'); charts.className='vx-charts';
+    // My attendance donut
+    const distribution = [
+      {l:'Present', v:att.present, c:'#7adf8a'},
+      {l:'Late', v:att.late, c:'#f5c451'},
+      {l:'Half', v:att.half, c:'#ff944d'},
+      {l:'Absent', v:att.absent, c:'#ff4d4f'}
+    ].filter(d=>d.v>0);
+    const ch1 = document.createElement('div'); ch1.className='vx-chart';
+    ch1.innerHTML = `<h4>My Attendance Distribution</h4>${distribution.length?svgDonut(distribution,{label:'DAYS'}):'<div style="text-align:center;color:#666;padding:30px">No attendance data yet</div>'}`;
+    charts.appendChild(ch1);
+
+    // Requests by status bar
+    const myByStatus = ['Pending','Approved','Rejected'].map(st=>({l:st, v:myReqs.filter(r=>r.status===st).length, c:st==='Approved'?'#7adf8a':st==='Rejected'?'#ff4d4f':'#f5c451'}));
+    const ch2 = document.createElement('div'); ch2.className='vx-chart';
+    ch2.innerHTML = `<h4>My Requests</h4>${svgBar(myByStatus)}`;
+    charts.appendChild(ch2);
+
+    v.appendChild(charts);
+
+    // Calendar
+    const calWrap = document.createElement('div');
+    calWrap.innerHTML = build3DCal(new Date());
+    v.appendChild(calWrap);
+  };
+
+  // ============ EMPLOYEE: Attendance override (no clock buttons) ============
+  RENDERERS.attendance = async function(){
+    const s = SESSION.get(); if (!s) return;
+    const v = $('view-attendance'); v.innerHTML='';
+    const emp = s.employee;
+    const today = new Date();
+    const currentKey = today.toISOString().slice(0,7);
+    const allMonths = Object.keys(ATT.load()).sort().reverse();
+    let viewMonth = currentKey;
+    if (!ATT.load()[currentKey] || !(ATT.load()[currentKey].byEmp||{})[emp.empId] || (ATT.load()[currentKey].byEmp[emp.empId]||[]).every(r=>r._auto && !r.ci)){
+      viewMonth = window.__veclarLatestMonthFor(emp.empId) || allMonths[0] || currentKey;
+    }
+
+    v.innerHTML = `<div class="hero"><div><h1>My <b>Attendance</b></h1>
+      <div class="sub">Shift ${VECLAR.SHIFT.start} – ${VECLAR.SHIFT.end} · From biometric device · Mon–Fri</div></div></div>`;
+
+    const switcher = document.createElement('div'); switcher.className='vx-month-switch';
+    function paintSwitcher(){
+      const keys = (allMonths.length?allMonths:[currentKey]);
+      switcher.innerHTML = keys.map(k=>`<button class="${k===viewMonth?'active':''}" data-k="${k}">${monthLabel(k)}</button>`).join('');
+      switcher.querySelectorAll('button').forEach(b=>b.onclick=()=>{ viewMonth = b.dataset.k; paintSwitcher(); paintTbl(); });
+    }
+    v.appendChild(switcher);
+    paintSwitcher();
+
+    const att = window.__attendanceDeductionsFor(emp.empId, viewMonth);
+    const stats = document.createElement('div'); stats.className='vx-dash';
+    v.appendChild(stats);
+    const panel = document.createElement('div'); panel.className='panel';
+    panel.innerHTML = `<h3><span class="accent"></span>Records — ${monthLabel(viewMonth)}</h3><div class="scroll-x"><table class="tbl"><thead><tr><th>Date</th><th>Check In</th><th>Check Out</th><th>Status</th><th>Deduction</th></tr></thead><tbody id="vxMyAttBody"></tbody></table></div>`;
+    v.appendChild(panel);
+
+    function paintTbl(){
+      const data = window.__attendanceDeductionsFor(emp.empId, viewMonth);
+      stats.innerHTML = [
+        {l:'Present',n:data.present,ic:'✅'},
+        {l:'Late',n:data.late,ic:'⏰'},
+        {l:'Half',n:data.half,ic:'🌗'},
+        {l:'Absent',n:data.absent,ic:'❌'},
+        {l:'Deduction',n:'₨'+(data.total/1000).toFixed(1)+'k',ic:'💸'}
+      ].map(t=>`<div class="vx-tile"><div class="vx-ic">${t.ic}</div><div class="vx-l">${t.l}</div><div class="vx-n">${t.n}</div></div>`).join('');
+      const tb = panel.querySelector('#vxMyAttBody');
+      if (!data.rows.length){ tb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#666;padding:30px">No attendance for ${monthLabel(viewMonth)}</td></tr>`; return; }
+      tb.innerHTML = data.rows.slice().sort((a,b)=>a.date<b.date?-1:1).map(r=>{
+        const stat = r.status||'—';
+        const cls = stat==='Present'?'ok':stat==='Absent'?'bad':'warn';
+        return `<tr><td>${fmtDate(r.date)}</td><td>${fmtTime12(r.ci)}</td><td>${fmtTime12(r.co)}</td><td><span class="pill ${cls}">${stat}</span></td><td>₨${r.deduction||0}</td></tr>`;
+      }).join('');
+    }
+    paintTbl();
+  };
+
+  // ============ EMPLOYEE: Payroll override (locked-only) ============
+  const ORIG_PAYROLL = RENDERERS.payroll;
+  RENDERERS.payroll = async function(){
+    const s = SESSION.get(); if (!s) return;
+    const v = $('view-payroll'); v.innerHTML='';
+    const emp = s.employee;
+    const locked = window.payLockGet ? window.payLockGet(emp.empId) : false;
+    v.innerHTML = `<div class="hero"><div><h1>My <b>Payroll</b></h1><div class="sub">Cycle salaries are released after admin lock</div></div></div>`;
+
+    // Past months (build a list from PAYROLL_INPUTS or static last 3)
+    const months = [];
+    for (let i=0;i<6;i++){
+      const d = new Date(); d.setMonth(d.getMonth()-i);
+      months.push(d.toISOString().slice(0,7));
+    }
+    const switcher = document.createElement('div'); switcher.className='vx-month-switch';
+    let viewMonth = months[locked?0:1] || months[0];
+    function paintSwitcher(){
+      switcher.innerHTML = months.map(k=>`<button class="${k===viewMonth?'active':''}" data-k="${k}">${monthLabel(k)}</button>`).join('');
+      switcher.querySelectorAll('button').forEach(b=>b.onclick=()=>{ viewMonth = b.dataset.k; paintSwitcher(); paintBody(); });
+    }
+    v.appendChild(switcher); paintSwitcher();
+
+    const body = document.createElement('div'); v.appendChild(body);
+    async function paintBody(){
+      const currentKey = new Date().toISOString().slice(0,7);
+      // current-month unlocked → show Oops; past months always show
+      if (viewMonth===currentKey && !locked){
+        body.innerHTML = `<div class="vx-empty"><div class="vx-emoji">📭</div><h2>Oops! It looks like your payroll is not ready yet.</h2><p>Once HR finalises this cycle, your payslip will appear here. Try switching to a previous month below.</p></div>`;
+        return;
+      }
+      const r = await api('computePayroll',{empId:emp.empId, cycleKey:viewMonth});
+      const p = r.data||{};
+      body.innerHTML = `<div class="panel"><h3><span class="accent"></span>Payslip — ${monthLabel(viewMonth)}</h3>
+        <div class="kv"><span class="k">Basic</span><span class="v">${fmtMoney(p.basic||0)}</span></div>
+        <div class="kv"><span class="k">Daily</span><span class="v">${fmtMoney(p.daily||0)}</span></div>
+        <div class="kv"><span class="k">Present / Late / Half</span><span class="v">${p.present||0} / ${p.lates||0} / ${p.halfDays||0}</span></div>
+        <div class="kv"><span class="k">Attendance Deduction</span><span class="v">-${fmtMoney(p.attDeduction||0)}</span></div>
+        <div class="kv"><span class="k">Half-day Deduction</span><span class="v">-${fmtMoney(p.halfDed||0)}</span></div>
+        <div class="kv"><span class="k">Absent Deduction</span><span class="v">-${fmtMoney(p.absDed||0)}</span></div>
+        <div class="kv" style="border-top:1px solid var(--gold-dim);margin-top:8px;padding-top:12px"><span class="k" style="color:var(--gold);letter-spacing:.18em">NET PAY</span><span class="v" style="font-size:18px;color:var(--gold)">${fmtMoney(p.net||0)}</span></div>
+      </div>`;
+    }
+    paintBody();
+  };
+
+  // ============ EMPLOYEE: Profile override (settings style) ============
+  RENDERERS.profile = async function(){
+    const s = SESSION.get(); if (!s) return;
+    const v = $('view-profile'); v.innerHTML='';
+    const emp = s.employee;
+    const photo = (window._empPhoto&&window._empPhoto(emp,0))||'';
+    const sec = (icon, title, rows)=>`
+      <div class="vx-sec">
+        <div class="vx-sech"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${icon}</svg>${title}</div>
+        ${rows.map(([k,val])=>`<div class="vx-row"><span class="vx-rk">${k}</span><span class="vx-rv">${val||'—'}</span><span class="vx-rc">›</span></div>`).join('')}
+      </div>`;
+    v.innerHTML = `
+      <div class="vx-prof-hero">
+        <div class="vx-pp" style="background-image:url('${photo}')"></div>
+        <h2>${emp.name||''}</h2>
+        <div class="vx-prole">${emp.title||''} · ${emp.dept||''}</div>
+        <div class="vx-pid">ID ${emp.empId} ${emp.pseudoName?(' · aka '+emp.pseudoName):''}</div>
+      </div>
+      ${sec('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>','Personal Information',[
+        ['Full Name', emp.name],
+        ['Pseudo Name', emp.dept==='Sales' ? (emp.pseudoName||'—') : 'N/A'],
+        ['Gender', emp.gender||'—'],
+        ['Date of Birth', emp.dob||'—'],
+        ['CNIC', emp.cnic||'—'],
+        ['Phone', emp.phone||'—'],
+        ['Email', emp.email||'—'],
+        ['Address', emp.address||'—'],
+        ['Emergency Contact', emp.emergency||'—']
+      ])}
+      ${sec('<path d="M3 21h18"/><path d="M5 21V7l7-4 7 4v14"/><path d="M9 9h6v12"/>','Employment',[
+        ['Employee ID', emp.empId],
+        ['Designation', emp.title],
+        ['Department', emp.dept],
+        ['Join Date', emp.joinDate ? fmtDate(emp.joinDate):'—'],
+        ['Shift', VECLAR.SHIFT.start+' – '+VECLAR.SHIFT.end+' PKT'],
+        ['Status', emp.status||'Active']
+      ])}
+      ${sec('<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M2 10h20"/>','Bank & Salary',[
+        ['Bank', emp.bank||'—'],
+        ['IBAN', emp.iban||'—'],
+        ['Basic Salary', emp.basicSalary?fmtMoney(emp.basicSalary):'—']
+      ])}
+      ${sec('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>','Documents',[
+        ['CNIC Copy','Uploaded'],
+        ['Offer Letter','On file'],
+        ['Bank Verification','On file']
+      ])}
+      ${sec('<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 1 1-14 0 7 7 0 0 1 14 0z"/>','Preferences',[
+        ['Notifications','Enabled'],
+        ['Theme','Dark Gold'],
+        ['Language','English']
+      ])}
+      ${sec('<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>','Security',[
+        ['Change Password','Update'],
+        ['Two-Factor','Off'],
+        ['Last Login', new Date(s.at||Date.now()).toLocaleString()]
+      ])}
+      ${sec('<circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 2"/>','About',[
+        ['App','Veclar HRMS'],
+        ['Version','v1.021'],
+        ['Company',VECLAR.COMPANY]
+      ])}
+    `;
+  };
+
+  // ============ Hooks for requests → notifications ============
+  const _origApi = window.api || api;
+  // Wrap api to inject notifications on key actions
+  const apiRef = api;
+  const origDirect = demoApi;
+  window.__wrapDemoApi = function(){
+    const orig = window.demoApi || demoApi;
+    if (orig.__veclarWrapped) return;
+    const wrapped = function(action, p){
+      const r = orig(action, p);
+      try{
+        if (action==='approveRequest' || action==='rejectRequest'){
+          const req = (DEMO.requests||[]).find(x=>x.id===p.id);
+          if (req){
+            NOTIFS.push(req.empId, {title:'Request '+(action==='approveRequest'?'approved':'rejected'), body:`${req.type} on ${req.date}`, link:'requests'});
+          }
+        }
+        if (action==='submitRequest'){
+          const req = JSON.parse(p.payload||'{}');
+          NOTIFS.push('admin', {title:'New request', body:`${req.type} from ${req.empId}`, link:'admin-requests'});
+        }
+      }catch(e){}
+      return r;
+    };
+    wrapped.__veclarWrapped = true;
+    window.demoApi = wrapped;
+  };
+  // Replace internal reference via api()
+  try{ window.__wrapDemoApi(); }catch(e){}
+
+  // ============ Override buildNav to default to Home for employees + remove portal chip ============
+  const _origBuildNav = buildNav;
+  window.buildNav = function(role){
+    _origBuildNav(role);
+    // Hide portal chip
+    const pn = document.getElementById('panelName');
+    if (pn){ pn.style.display='none'; const sep = pn.previousElementSibling; if (sep && sep.classList.contains('sep')) sep.style.display='none'; }
+    // For employee, set Home as active default
+    if (role==='employee'){
+      document.querySelectorAll('.navbtn').forEach(b=>{
+        b.classList.toggle('active', b.dataset.tab==='home');
+      });
+    }
+    wireTopbar();
+  };
+  buildNav = window.buildNav;
+
+  // Hook switchView to refresh notifications on relevant tabs
+  const _origSwitchView = switchView;
+  window.switchView = function(id){
+    _origSwitchView(id);
+    renderNotifBadge();
+  };
+  switchView = window.switchView;
+
+  // BUS listeners
+  BUS.on('att:change', ()=>{ /* live refresh on next render */ });
+  BUS.on('payroll:refresh', ()=>{ const s=SESSION.get(); if (s && s.role==='employee'){ const cur=document.querySelector('#view-payroll.active'); if (cur && RENDERERS.payroll) RENDERERS.payroll(); } });
+
+  // ============ Hook into boot() ============
+  const _origBoot = boot;
+  boot = function(){
+    _origBoot();
+    // Re-wire after a tick for SESSION-resumed sessions
+    setTimeout(()=>{
+      const s = SESSION.get();
+      if (s){
+        // for employee, switch to Home explicitly (override default first nav)
+        if (s.role==='employee'){
+          try{ switchView('home'); }catch(e){}
+        }
+        wireTopbar();
+      }
+    }, 100);
+  };
+
+  // Also hook openDoorsAndReveal to wire topbar after door animation
+  if (typeof openDoorsAndReveal === 'function'){
+    const _origOpen = openDoorsAndReveal;
+    openDoorsAndReveal = async function(){
+      const r = await _origOpen();
+      setTimeout(()=>{
+        const s = SESSION.get();
+        if (s && s.role==='employee') try{ switchView('home'); }catch(e){}
+        wireTopbar();
+      }, 200);
+      return r;
+    };
+  }
+
+  // Make pdf.js available globally lazily
+  if (!window.pdfjsLib){
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    s.onload = ()=>{ if (window.pdfjsLib) window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; };
+    document.head.appendChild(s);
+  }
+})();
+
+  boot();
+})();
